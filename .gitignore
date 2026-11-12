@@ -1,0 +1,40 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Model binaries & caches (HuggingFace / ONNX large weights)
+src/model/.cache/
+model/.cache/
+*.onnx
+*.onnx_data
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Environment and secrets
+.env
+.env.local
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test reports / outputs
+tests/reports/
+*.log
+
