@@ -10,18 +10,14 @@ import requests
 from src.config import get_logger, GROQ_API_KEY, GROQ_API_URL, GROQ_MODELS_URL
 from src.rag.config import (
     DOMAINS_DATA_DIR,
+    CHROMA_DATA_DIR,
+    CHROMA_COLLECTION_NAME,
+    CHROMA_TOP_K,
+    CHROMA_SIMILARITY_THRESHOLD,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_DIMENSION,
     DEFAULT_RAG_LLM_MODEL,
     RAG_LLM_PRIORITY_MODELS,
-)
-from src.rag.schema import RAGSchemaResponse, RAGQueryRequest
-
-logger = get_logger(__name__)
-
-# =====================================================================
-# RAG Prompts (Integrated directly into service layer)
-# =====================================================================
-
-from src.rag.constants import (
     RAG_SYSTEM_PROMPT,
     RAG_CONTEXT_TEMPLATE,
     DOMAIN_PRIMARY_TABLES,
@@ -29,6 +25,9 @@ from src.rag.constants import (
     TABLE_SYNONYMS,
     NONEXISTENT_TABLE_PATTERNS,
 )
+from src.rag.schema import RAGSchemaResponse, RAGQueryRequest
+
+logger = get_logger(__name__)
 
 
 def build_rag_augmented_prompt(
@@ -157,11 +156,11 @@ def _compute_data_dir_mtime(data_dir: Path) -> float:
 def _load_erp_registry_from_postgres() -> Optional[Dict[str, Any]]:
     """Loads ERP schema registry directly from PostgreSQL knowledge base."""
     try:
-        from src.rag.db.database import get_db, is_db_connected
+        from src.rag.database import get_db, is_db_connected
         if not is_db_connected():
             return None
 
-        from src.rag.db.models import DomainModel, KnowledgeTableModel, KnowledgeColumnModel, TableDependencyModel
+        from src.rag.models import DomainModel, KnowledgeTableModel, KnowledgeColumnModel, TableDependencyModel
 
         registry: Dict[str, Any] = {
             "domains": {},
@@ -1966,3 +1965,504 @@ def generate_rag_llm(
 ) -> Dict[str, Any]:
     """Standard entry point for RAG-augmented LLM generation."""
     return get_rag_service().generate_with_llm(query=query, api_key=api_key, model=model, domain=domain)
+
+
+# =============================================================================
+# Local Embedding Model (SentenceTransformer)
+# =============================================================================
+
+_EMBEDDING_MODEL: Any = None
+
+
+def get_embedding_model():
+    """
+    Lazy loads SentenceTransformer locally on CPU with zero remote network delays.
+    Generates normalized 384-dimensional dense vectors for semantic search.
+    """
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Loading local embedding model: '{EMBEDDING_MODEL_NAME}'...")
+        try:
+            _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME, local_files_only=True)
+        except Exception:
+            _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _EMBEDDING_MODEL
+
+
+# =============================================================================
+# ChromaDB Vector Engine & Client Singleton
+# =============================================================================
+
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+logging.getLogger("chromadb.telemetry.posthog").setLevel(logging.ERROR)
+
+_CHROMA_CLIENT: Optional[Any] = None
+_CHROMA_COLLECTION: Optional[Any] = None
+
+
+def get_chroma_client():
+    """Returns a singleton ChromaDB PersistentClient."""
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        import chromadb
+        from chromadb.config import Settings
+        CHROMA_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Initializing ChromaDB PersistentClient at: {CHROMA_DATA_DIR}")
+        _CHROMA_CLIENT = chromadb.PersistentClient(
+            path=str(CHROMA_DATA_DIR),
+            settings=Settings(anonymized_telemetry=False)
+        )
+    return _CHROMA_CLIENT
+
+
+def get_chroma_collection(collection_name: str = CHROMA_COLLECTION_NAME):
+    """Returns the ChromaDB collection with cosine distance metric."""
+    global _CHROMA_COLLECTION
+    if _CHROMA_COLLECTION is None or _CHROMA_COLLECTION.name != collection_name:
+        client = get_chroma_client()
+        logger.info(f"Getting or creating ChromaDB collection: '{collection_name}' (cosine metric)")
+        _CHROMA_COLLECTION = client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+    return _CHROMA_COLLECTION
+
+
+class ChromaSchemaEngine:
+    """
+    Production ChromaDB Vector Engine for ERP Schema Knowledge Base.
+    Features:
+    - Persistent SQLite + HNSW storage in CHROMA_DATA_DIR.
+    - Native metadata filtering by domain, table, segment_type, or identity_key.
+    - Zero-loop O(1) single-chunk upserts and deletions by permanent UUID.
+    - Normalized cosine vector similarity using local sentence-transformers.
+    """
+
+    def __init__(self, data_dir: Path = CHROMA_DATA_DIR, collection_name: str = CHROMA_COLLECTION_NAME):
+        self.data_dir = data_dir
+        self.collection_name = collection_name
+        self.client = get_chroma_client()
+        self.collection = get_chroma_collection(collection_name)
+
+    def count(self) -> int:
+        """Returns the total number of vectors in the collection."""
+        try:
+            return self.collection.count()
+        except Exception as e:
+            logger.warning(f"Error getting ChromaDB count: {e}")
+            return 0
+
+    def upsert_segment(
+        self,
+        segment_id: str,
+        document: str,
+        metadata: Dict[str, Any],
+        embedding: Optional[Any] = None
+    ):
+        """Upserts a single segment in-place by ID (Zero ghost chunks)."""
+        clean_meta = {}
+        for k, v in metadata.items():
+            if isinstance(v, (str, int, float, bool)):
+                clean_meta[k] = v
+            elif isinstance(v, list):
+                clean_meta[k] = ", ".join(str(item) for item in v)
+            elif v is not None:
+                clean_meta[k] = str(v)
+
+        if embedding is None:
+            model = get_embedding_model()
+            emb = model.encode(document, convert_to_numpy=True, normalize_embeddings=True)
+            emb_list = emb.tolist()
+        elif hasattr(embedding, "tolist"):
+            emb_list = embedding.tolist()
+        else:
+            emb_list = embedding
+
+        self.collection.upsert(
+            ids=[str(segment_id)],
+            documents=[document],
+            metadatas=[clean_meta],
+            embeddings=[emb_list]
+        )
+
+    def upsert_batch(
+        self,
+        ids: List[str],
+        documents: List[str],
+        metadatas: List[Dict[str, Any]],
+        embeddings: Optional[Any] = None
+    ):
+        """Batch upsert multiple segments with optional pre-computed embeddings."""
+        if not ids:
+            return
+
+        clean_metadatas = []
+        for meta in metadatas:
+            clean_m = {}
+            for k, v in meta.items():
+                if isinstance(v, (str, int, float, bool)):
+                    clean_m[k] = v
+                elif isinstance(v, list):
+                    clean_m[k] = ", ".join(str(item) for item in v)
+                elif v is not None:
+                    clean_m[k] = str(v)
+            clean_metadatas.append(clean_m)
+
+        if embeddings is None:
+            model = get_embedding_model()
+            emb_arr = model.encode(documents, convert_to_numpy=True, normalize_embeddings=True)
+            emb_list = emb_arr.tolist()
+        elif hasattr(embeddings, "tolist"):
+            emb_list = embeddings.tolist()
+        else:
+            emb_list = embeddings
+
+        self.collection.upsert(
+            ids=[str(i) for i in ids],
+            documents=documents,
+            metadatas=clean_metadatas,
+            embeddings=emb_list
+        )
+
+    def delete_segment(self, segment_id: str):
+        """Deletes a segment by ID from ChromaDB."""
+        try:
+            self.collection.delete(ids=[str(segment_id)])
+            logger.info(f"Deleted segment '{segment_id}' from ChromaDB.")
+        except Exception as e:
+            logger.warning(f"Error deleting segment '{segment_id}' from ChromaDB: {e}")
+
+    def get_segment(self, segment_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches a specific segment by its permanent ID."""
+        try:
+            res = self.collection.get(ids=[str(segment_id)], include=["documents", "metadatas"])
+            if res and res.get("ids") and len(res["ids"]) > 0:
+                return {
+                    "id": res["ids"][0],
+                    "document": res["documents"][0] if res.get("documents") else "",
+                    "metadata": res["metadatas"][0] if res.get("metadatas") else {}
+                }
+        except Exception as e:
+            logger.warning(f"Error fetching segment '{segment_id}' from ChromaDB: {e}")
+        return None
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        where: Optional[Dict[str, Any]] = None,
+        where_document: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Executes semantic search with native metadata filtering."""
+        model = get_embedding_model()
+        query_emb = model.encode(query, convert_to_numpy=True, normalize_embeddings=True)
+        emb_list = query_emb.tolist()
+
+        kwargs: Dict[str, Any] = {
+            "query_embeddings": [emb_list],
+            "n_results": min(top_k, max(self.count(), 1)),
+            "include": ["documents", "metadatas", "distances"]
+        }
+        if where:
+            kwargs["where"] = where
+        if where_document:
+            kwargs["where_document"] = where_document
+
+        try:
+            raw_res = self.collection.query(**kwargs)
+        except Exception as e:
+            logger.error(f"ChromaDB search query failed: {e}")
+            return []
+
+        results: List[Dict[str, Any]] = []
+        if not raw_res or not raw_res.get("ids") or len(raw_res["ids"]) == 0:
+            return results
+
+        ids = raw_res["ids"][0]
+        docs = raw_res.get("documents", [[]])[0]
+        metas = raw_res.get("metadatas", [[]])[0]
+        dists = raw_res.get("distances", [[]])[0]
+
+        for i, seg_id in enumerate(ids):
+            dist = dists[i] if i < len(dists) else 1.0
+            similarity = max(0.0, 1.0 - dist)
+            results.append({
+                "id": seg_id,
+                "similarity": similarity,
+                "distance": dist,
+                "document": docs[i] if i < len(docs) else "",
+                "metadata": metas[i] if i < len(metas) else {}
+            })
+
+        return results
+
+
+_CHROMA_ENGINE: Optional[ChromaSchemaEngine] = None
+
+
+def get_chroma_engine() -> ChromaSchemaEngine:
+    """Returns singleton ChromaSchemaEngine."""
+    global _CHROMA_ENGINE
+    if _CHROMA_ENGINE is None:
+        _CHROMA_ENGINE = ChromaSchemaEngine()
+    return _CHROMA_ENGINE
+
+
+# =============================================================================
+# ChromaDB <-> PostgreSQL Knowledge Synchronizer
+# =============================================================================
+
+class ChromaPostgresSynchronizer:
+    """
+    Synchronizes PostgreSQL primary knowledge base with ChromaDB vector engine.
+    """
+
+    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME):
+        self.model_name = model_name
+        self.chroma_engine = get_chroma_engine()
+
+    def process_pending_jobs(self, batch_size: int = 128, session: Optional[Any] = None) -> Dict[str, int]:
+        """Processes PENDING embedding_jobs from PostgreSQL."""
+        import numpy as np
+        from src.rag.database import get_db, KnowledgeBaseRepository
+        from src.rag.models import KnowledgeSegmentModel, EmbeddingJobModel, DomainModel, KnowledgeTableModel
+
+        stats = {"processed": 0, "inserted": 0, "updated": 0, "deleted": 0, "failed": 0}
+
+        def _run(sess):
+            repo = KnowledgeBaseRepository(sess)
+            jobs = repo.get_pending_embedding_jobs(limit=batch_size)
+            if not jobs:
+                return stats
+
+            logger.info(f"Processing batch of {len(jobs)} pending embedding jobs for ChromaDB...")
+            model = get_embedding_model()
+
+            dom_map = {d.id: d.domain_id for d in repo.session.query(DomainModel).all()}
+            table_map = {t.id: t.table_name for t in repo.session.query(KnowledgeTableModel).all()}
+
+            to_encode_jobs: List[Tuple[Any, Any]] = []
+            delete_jobs: List[Any] = []
+
+            for job in jobs:
+                seg = repo.get_segment_by_id(job.segment_id)
+                if job.operation == "DELETE" or (seg and not seg.is_active):
+                    delete_jobs.append(job)
+                elif seg and seg.is_active:
+                    to_encode_jobs.append((job, seg))
+                else:
+                    repo.update_job_status(job.id, "COMPLETED")
+                    stats["processed"] += 1
+
+            for job in delete_jobs:
+                try:
+                    self.chroma_engine.delete_segment(str(job.segment_id))
+                    repo.update_job_status(job.id, "COMPLETED")
+                    stats["deleted"] += 1
+                    stats["processed"] += 1
+                except Exception as e:
+                    repo.update_job_status(job.id, "FAILED", error_message=str(e))
+                    stats["failed"] += 1
+
+            if to_encode_jobs:
+                texts = [seg.content for _, seg in to_encode_jobs]
+                try:
+                    embeddings = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+                except Exception as enc_err:
+                    logger.error(f"Failed to generate embeddings: {enc_err}")
+                    for job, _ in to_encode_jobs:
+                        repo.update_job_status(job.id, "FAILED", error_message=str(enc_err))
+                        stats["failed"] += 1
+                    return stats
+
+                for i, (job, seg) in enumerate(to_encode_jobs):
+                    try:
+                        emb = embeddings[i : i + 1].astype(np.float32)
+                        d_code = dom_map.get(seg.domain_id, "")
+                        t_name = table_map.get(seg.table_id, "") if seg.table_id else (
+                            seg.segment_name.split(".")[0]
+                            if "." in seg.segment_name and seg.segment_type in ("table", "column", "relationship")
+                            else ""
+                        )
+                        ident_key = f"{d_code or str(seg.domain_id)}:{t_name or 'none'}:{seg.segment_name}"
+
+                        meta = {
+                            "domain_id": str(seg.domain_id),
+                            "domain_code": d_code,
+                            "domain_name": seg.section,
+                            "table_id": str(seg.table_id) if seg.table_id else "",
+                            "table_name": t_name,
+                            "topic": seg.topic,
+                            "segment_type": seg.segment_type,
+                            "segment_name": seg.segment_name,
+                            "version": seg.version,
+                            "identity_key": ident_key,
+                        }
+
+                        self.chroma_engine.upsert_segment(
+                            segment_id=str(seg.id),
+                            document=seg.content,
+                            metadata=meta,
+                            embedding=emb[0]
+                        )
+
+                        if job.operation == "INSERT":
+                            stats["inserted"] += 1
+                        else:
+                            stats["updated"] += 1
+
+                        repo.update_job_status(job.id, "COMPLETED")
+                        stats["processed"] += 1
+                    except Exception as job_err:
+                        logger.error(f"Failed processing job {job.id} for segment {seg.id}: {job_err}")
+                        repo.update_job_status(job.id, "FAILED", error_message=str(job_err))
+                        stats["failed"] += 1
+
+            return stats
+
+        if session:
+            return _run(session)
+        else:
+            from src.rag.database import get_db
+            with get_db() as sess:
+                return _run(sess)
+
+    def sync_all(self, batch_size: int = 128) -> Dict[str, int]:
+        """Runs batch processing until no PENDING jobs remain."""
+        total_stats = {"processed": 0, "inserted": 0, "updated": 0, "deleted": 0, "failed": 0}
+        while True:
+            cur = self.process_pending_jobs(batch_size=batch_size)
+            if cur["processed"] == 0 and cur["failed"] == 0:
+                break
+            for k in total_stats:
+                total_stats[k] += cur.get(k, 0)
+        logger.info(f"All pending ChromaDB embedding jobs synchronized: {total_stats}")
+        return total_stats
+
+    def search_active_segments(
+        self,
+        query: str,
+        top_k: int = CHROMA_TOP_K,
+        domain_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Executes semantic search against ChromaDB resolved to PostgreSQL segments."""
+        where_filter = None
+        if domain_id:
+            if len(domain_id) == 36 and "-" in domain_id:
+                where_filter = {"domain_id": domain_id}
+            else:
+                where_filter = {"domain_code": domain_id.lower()}
+
+        chroma_res = self.chroma_engine.search(query=query, top_k=top_k, where=where_filter)
+        results = []
+        if not chroma_res:
+            return results
+
+        import uuid
+        from src.rag.database import get_db, KnowledgeBaseRepository
+
+        with get_db() as sess:
+            repo = KnowledgeBaseRepository(sess)
+            for cr in chroma_res:
+                seg_uuid_str = cr["id"]
+                try:
+                    seg = repo.get_segment_by_id(uuid.UUID(seg_uuid_str))
+                except Exception:
+                    seg = None
+
+                if not seg or not seg.is_active:
+                    continue
+
+                results.append({
+                    "segment_id": str(seg.id),
+                    "domain_id": str(seg.domain_id),
+                    "table_id": str(seg.table_id) if seg.table_id else None,
+                    "section": seg.section,
+                    "topic": seg.topic,
+                    "segment_type": seg.segment_type,
+                    "segment_name": seg.segment_name,
+                    "content": seg.content,
+                    "content_hash": seg.content_hash,
+                    "version": seg.version,
+                    "score": float(cr.get("similarity", 0.0)),
+                    "identity_key": cr.get("metadata", {}).get("identity_key", ""),
+                    "vector_engine": "chroma",
+                })
+
+        return results
+
+
+def sync_chroma_from_postgres(batch_size: int = 128) -> int:
+    """Populates ChromaDB with all active knowledge segments from PostgreSQL."""
+    from src.rag.database import get_db, KnowledgeBaseRepository
+    from src.rag.models import KnowledgeSegmentModel, DomainModel, KnowledgeTableModel
+
+    chroma_engine = get_chroma_engine()
+    model = get_embedding_model()
+
+    with get_db() as sess:
+        repo = KnowledgeBaseRepository(sess)
+        dom_map = {d.id: d.domain_id for d in repo.session.query(DomainModel).all()}
+        table_map = {t.id: t.table_name for t in repo.session.query(KnowledgeTableModel).all()}
+
+        active_segs = repo.session.query(KnowledgeSegmentModel).filter(
+            KnowledgeSegmentModel.is_active == True
+        ).all()
+
+        total = len(active_segs)
+        logger.info(f"Synchronizing {total} active segments from PostgreSQL to ChromaDB...")
+
+        for i in range(0, total, batch_size):
+            batch = active_segs[i : i + batch_size]
+            ids = [str(s.id) for s in batch]
+            docs = [s.content for s in batch]
+            metas = []
+            for s in batch:
+                d_code = dom_map.get(s.domain_id, "")
+                t_name = table_map.get(s.table_id, "") if s.table_id else (
+                    s.segment_name.split(".")[0]
+                    if "." in s.segment_name and s.segment_type in ("table", "column", "relationship")
+                    else ""
+                )
+                ident_key = f"{d_code or str(s.domain_id)}:{t_name or 'none'}:{s.segment_name}"
+                metas.append({
+                    "domain_id": str(s.domain_id),
+                    "domain_code": d_code,
+                    "domain_name": s.section,
+                    "table_id": str(s.table_id) if s.table_id else "",
+                    "table_name": t_name,
+                    "topic": s.topic,
+                    "segment_type": s.segment_type,
+                    "segment_name": s.segment_name,
+                    "version": s.version,
+                    "identity_key": ident_key,
+                })
+            embs = model.encode(docs, convert_to_numpy=True, normalize_embeddings=True)
+            chroma_engine.upsert_batch(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+
+        logger.info(f"ChromaDB synchronized successfully! Total vectors in ChromaDB: {chroma_engine.count()}")
+        return total
+
+
+_SYNC_INSTANCE: Optional[ChromaPostgresSynchronizer] = None
+
+
+def get_embedding_synchronizer() -> ChromaPostgresSynchronizer:
+    global _SYNC_INSTANCE
+    if _SYNC_INSTANCE is None:
+        _SYNC_INSTANCE = ChromaPostgresSynchronizer()
+    return _SYNC_INSTANCE
+
+
+# Re-export chunking helpers from src.rag.database for convenience
+from src.rag.database import (
+    compute_sha256,
+    generate_stable_segment_uuid,
+    KnowledgeChunk,
+    build_domain_chunk,
+    build_table_chunk,
+    build_column_chunk,
+    build_relationship_chunk,
+)
+

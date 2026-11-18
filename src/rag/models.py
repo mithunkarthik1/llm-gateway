@@ -17,9 +17,9 @@ from sqlalchemy import (
     func
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import declarative_base, relationship
 
-from src.rag.db.database import Base
+Base = declarative_base()
 
 
 def generate_uuid() -> uuid.UUID:
@@ -305,7 +305,7 @@ class EmbeddingJobModel(Base):
 
 
 # ---------------------------------------------------------------------
-# H. SegmentVectorModel: segment_vectors table (UUID -> FAISS integer ID)
+# H. SegmentVectorModel: segment_vectors table
 # ---------------------------------------------------------------------
 class SegmentVectorModel(Base):
     __tablename__ = "segment_vectors"

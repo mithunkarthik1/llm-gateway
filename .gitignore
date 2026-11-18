@@ -36,6 +36,7 @@ Thumbs.db
 
 # Test reports / outputs
 tests/reports/
+*benchmark_results.json
 *.log
 
 #knowledge base 

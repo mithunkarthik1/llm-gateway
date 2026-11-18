@@ -6,8 +6,19 @@ import uuid
 from pathlib import Path
 
 from src.rag.config import DATABASE_URL
-from src.rag.db.database import get_db, init_db
-from src.rag.db.models import (
+from src.rag.database import (
+    get_db,
+    init_db,
+    KnowledgeBaseRepository,
+    JSONKnowledgeBaseMigrator,
+    compute_sha256,
+    generate_stable_segment_uuid,
+    build_domain_chunk,
+    build_table_chunk,
+    build_column_chunk,
+    build_relationship_chunk,
+)
+from src.rag.models import (
     DomainModel,
     KnowledgeTableModel,
     KnowledgeColumnModel,
@@ -17,18 +28,12 @@ from src.rag.db.models import (
     EmbeddingJobModel,
     SegmentVectorModel,
 )
-from src.rag.db.repository import KnowledgeBaseRepository
-from src.rag.db.chunking import (
-    compute_sha256,
-    generate_stable_segment_uuid,
-    build_domain_chunk,
-    build_table_chunk,
-    build_column_chunk,
-    build_relationship_chunk,
+from src.rag.service import (
+    ChromaPostgresSynchronizer,
+    get_embedding_synchronizer,
+    retrieve_erp_schema,
+    load_erp_registry,
 )
-from src.rag.db.migration_service import JSONKnowledgeBaseMigrator
-from src.rag.db.embedding_sync import FAISSPostgresSynchronizer
-from src.rag.service import retrieve_erp_schema, load_erp_registry
 
 
 class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
@@ -171,25 +176,25 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
             session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.id == inactive_uuid).delete()
 
     # =========================================================================
-    # 3. FAISS Synchronization & ID Mapping
+    # 3. Vector Database Synchronization & Persistence (ChromaDB)
     # =========================================================================
 
-    def test_07_faiss_id_mapping_and_vector_persistence(self):
-        """Verify FAISS integer ID resolves to PostgreSQL segment UUID."""
-        syncer = FAISSPostgresSynchronizer()
+    def test_07_chroma_vector_persistence_and_retrieval(self):
+        """Verify ChromaDB vector search resolves to active PostgreSQL segment UUID."""
+        from src.rag.service import get_embedding_synchronizer
+        syncer = get_embedding_synchronizer()
         results = syncer.search_active_segments("customer invoices billing due date", top_k=1)
         self.assertGreater(len(results), 0)
         top = results[0]
         self.assertIn("customer_invoices", top["segment_name"])
-        self.assertIsNotNone(top["faiss_id"])
         self.assertIsNotNone(top["segment_id"])
 
-        # Check DB mapping
+        # Check DB model
         with get_db() as session:
             repo = KnowledgeBaseRepository(session)
-            mapping = repo.get_segment_vector_by_faiss_id(syncer.model_name, top["faiss_id"])
-            self.assertIsNotNone(mapping)
-            self.assertEqual(str(mapping.segment_id), top["segment_id"])
+            seg = repo.get_segment_by_id(uuid.UUID(top["segment_id"]))
+            self.assertIsNotNone(seg)
+            self.assertEqual(str(seg.id), top["segment_id"])
 
     # =========================================================================
     # 4. End-to-End RAG Retrieval with PostgreSQL Primary

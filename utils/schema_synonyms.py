@@ -1,113 +1,15 @@
+"""
+Canonical Schema Synonyms & Anti-Hallucination Patterns.
+Provides natural language synonym mappings to master tables and boundary rejection lists.
+"""
 from typing import Dict, List
 
 # =====================================================================
-# RAG Prompts
-# =====================================================================
-
-RAG_SYSTEM_PROMPT = """You are an Enterprise ERP Database Architect specializing in PostgreSQL and MySQL relational schemas.
-You have access to a validated, production-grade enterprise schema knowledge base.
-
-Rules:
-1. Adhere strictly to the domain relationships, primary/foreign key hierarchies, and column data types provided in the retrieved schema context.
-2. Preserve double-entry accounting integrity, financial cutoffs, audit trails, and referential integrity.
-3. When extending or modifying the schema, maintain topological ordering so parent tables precede dependent child tables.
-4. Output clean, syntactically correct SQL DDL with appropriate constraints and indices.
-"""
-
-RAG_CONTEXT_TEMPLATE = """### RETRIEVED ENTERPRISE ERP SCHEMA CONTEXT:
-Domain: {domain_name} ({domain_id})
-Available Tables: {tables}
-
-{schema_ddl}
-
-### ACTIVE SCHEMA SUMMARY LEDGER:
-{summary}
-
-### USER INSTRUCTION:
-{user_query}
-
-Generate the exact SQL schema DDL satisfying the instruction while respecting the architectural standards and relationships above.
-"""
-
-# =====================================================================
-# Domain Primary Tables Prioritization (Top-3 Core Master Entities)
-# =====================================================================
-
-DOMAIN_PRIMARY_TABLES: Dict[str, List[str]] = {
-    "erp_finance": [
-        "chart_of_accounts",
-        "finance_customers",
-        "customer_invoices",
-        "journal_entries",
-        "payments"
-    ],
-    "erp_supply_chain": [
-        "product_items",
-        "warehouses",
-        "inventory_stocks",
-        "purchase_orders",
-        "suppliers"
-    ],
-    "erp_hrms": [
-        "hrms_departments",
-        "hrms_designations",
-        "hrms_employees",
-        "hrms_attendance",
-        "hrms_payrolls"
-    ],
-    "erp_ecommerce": [
-        "categories",
-        "customers",
-        "products",
-        "orders",
-        "order_items"
-    ],
-    "erp_healthcare": [
-        "departments",
-        "doctors",
-        "patients",
-        "appointments",
-        "prescriptions"
-    ]
-}
-
-# =====================================================================
-# Table Primary Columns Prioritization (PK + Core Business Identifiers)
-# =====================================================================
-
-TABLE_PRIMARY_COLUMNS_MAP: Dict[str, List[str]] = {
-    "chart_of_accounts": ["id", "account_code", "account_name", "account_type", "is_active"],
-    "finance_customers": ["id", "customer_number", "customer_name", "credit_limit", "gl_account_id"],
-    "customer_invoices": ["id", "invoice_number", "total_amount", "due_date", "customer_id", "status"],
-    "journal_entries": ["id", "entry_number", "entry_date", "description", "posted"],
-    "payments": ["id", "payment_number", "amount", "payment_date", "payment_method"],
-    "hrms_departments": ["id", "dept_code", "dept_name", "is_active"],
-    "hrms_designations": ["id", "designation_name", "grade_level"],
-    "hrms_employees": ["id", "employee_code", "full_name", "department_id", "designation_id", "salary"],
-    "hrms_attendance": ["id", "employee_id", "work_date", "check_in", "check_out", "status"],
-    "hrms_payrolls": ["id", "employee_id", "pay_month", "net_salary", "basic_salary"],
-    "product_items": ["id", "sku_code", "product_name", "unit_price", "category"],
-    "warehouses": ["id", "warehouse_code", "warehouse_name", "location_city"],
-    "inventory_stocks": ["id", "product_id", "warehouse_id", "quantity_on_hand", "reorder_level"],
-    "suppliers": ["id", "supplier_code", "supplier_name", "contact_email"],
-    "purchase_orders": ["id", "po_number", "order_date", "total_amount", "supplier_id"],
-    "categories": ["id", "name", "slug", "parent_id"],
-    "customers": ["id", "first_name", "last_name", "email", "phone"],
-    "products": ["id", "name", "sku", "price", "stock_quantity", "category_id"],
-    "orders": ["id", "order_number", "total_amount", "status", "customer_id"],
-    "order_items": ["id", "order_id", "product_id", "quantity", "unit_price"],
-    "departments": ["id", "dept_code", "dept_name", "floor_no"],
-    "doctors": ["id", "full_name", "specialization", "license_no", "department_id"],
-    "patients": ["id", "mrn", "full_name", "date_of_birth", "gender", "phone"],
-    "appointments": ["id", "patient_id", "doctor_id", "appointment_date", "status"],
-    "prescriptions": ["id", "patient_id", "doctor_id", "prescription_date", "notes"]
-}
-
-# =====================================================================
-# Canonical Schema Synonyms
+# Canonical Schema Synonyms (Natural Language -> Canonical Master Tables)
 # =====================================================================
 
 TABLE_SYNONYMS: Dict[str, str] = {
+    # Finance domain synonyms
     "customer invoices": "customer_invoices",
     "customer invoice": "customer_invoices",
     "invoices": "customer_invoices",
@@ -127,6 +29,10 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "journal entry": "journal_entries",
     "accounting entry": "journal_entries",
     "accounting entries": "journal_entries",
+    "payments": "payments",
+    "payment": "payments",
+
+    # HRMS domain synonyms
     "hrms departments": "hrms_departments",
     "hrms department": "hrms_departments",
     "departments": "hrms_departments",
@@ -137,6 +43,7 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "designation": "hrms_designations",
     "hrms employees": "hrms_employees",
     "hrms employee": "hrms_employees",
+    "employees": "hrms_employees",
     "attendance": "hrms_attendance",
     "employee attendance": "hrms_attendance",
     "attendance records": "hrms_attendance",
@@ -146,6 +53,8 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "hrms payroll": "hrms_payrolls",
     "hrms payrolls": "hrms_payrolls",
     "employee payroll": "hrms_payrolls",
+
+    # Supply Chain domain synonyms
     "product items": "product_items",
     "product item": "product_items",
     "product details": "product_items",
@@ -178,6 +87,7 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "supplier details": "suppliers",
     "suppliers": "suppliers",
     "supplier": "suppliers",
+
     # E-Commerce domain synonyms
     "categories": "categories",
     "category": "categories",
@@ -215,6 +125,7 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "order refunds": "order_refunds",
     "order refund": "order_refunds",
     "refunds": "order_refunds",
+
     # Healthcare domain synonyms
     "doctors": "doctors",
     "doctor": "doctors",
@@ -259,6 +170,10 @@ TABLE_SYNONYMS: Dict[str, str] = {
     "hospital bills": "patient_bills",
 }
 
+# =====================================================================
+# Anti-Hallucination Rejection Patterns (Nonexistent Entities)
+# =====================================================================
+
 NONEXISTENT_TABLE_PATTERNS: List[str] = [
     "employee_benefits", "employee benefits", "benefits table",
     "salary_history", "salary history", "payment_history", "payment history",
@@ -266,4 +181,9 @@ NONEXISTENT_TABLE_PATTERNS: List[str] = [
     "leave_requests", "leave request", "leave requests",
     "supplier_payment", "supplier payment", "customer_complaints", "customer complaints", "customer payment",
     "customer payment history"
+]
+
+__all__ = [
+    "TABLE_SYNONYMS",
+    "NONEXISTENT_TABLE_PATTERNS",
 ]

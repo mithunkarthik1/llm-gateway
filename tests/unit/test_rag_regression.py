@@ -10,7 +10,6 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from src.rag.service import retrieve_erp_schema, load_erp_registry
-from src.rag.faiss_service import get_faiss_engine
 
 
 class TestEnterpriseRAGRegression(unittest.TestCase):
@@ -27,7 +26,6 @@ class TestEnterpriseRAGRegression(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.registry = load_erp_registry()
-        cls.engine = get_faiss_engine()
 
     # Scenario 1: Complete ERP schema retrieval across all domains
     def test_01_complete_erp_schema(self):

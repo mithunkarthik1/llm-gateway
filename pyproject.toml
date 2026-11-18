@@ -1,0 +1,36 @@
+[project]
+name = "nexus-llm-gateway"
+version = "1.0.0"
+description = "Enterprise ERP RAG & Neural SQL Schema Generation Gateway with ChromaDB and PostgreSQL"
+authors = [{name = "Nexus Engineering Team"}]
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.115.9",
+    "uvicorn[standard]>=0.18.3",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.0.0",
+    "requests>=2.31.0",
+    "torch>=2.0.0",
+    "transformers>=4.36.0,<4.58.0",
+    "optimum>=1.14.0",
+    "optimum-onnx>=0.1.0",
+    "onnxruntime>=1.14.1",
+    "pandas>=2.0.0",
+    "sqlglot>=20.0.0",
+    "openpyxl>=3.1.0",
+    "chromadb>=1.0.0",
+    "psycopg2-binary>=2.9.0",
+    "sqlalchemy>=2.0.0",
+    "sentence-transformers>=2.2.0"
+]
+
+[project.scripts]
+start = "src.main:app"
+
+[tool.poetry]
+packages = [{include = "src"}]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

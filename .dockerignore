@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Git and development files
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+
+# Testing and reports
+tests/
+*benchmark_results.json
+*.tmp
+*.log
+
+# Docker metadata
+Dockerfile
+docker-compose*.yml
+.dockerignore

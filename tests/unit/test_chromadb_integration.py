@@ -2,8 +2,7 @@ import unittest
 import uuid
 import numpy as np
 
-from src.rag.chroma_service import get_chroma_engine, ChromaSchemaEngine
-from src.rag.db.embedding_sync import get_faiss_synchronizer, sync_chroma_from_postgres
+from src.rag.service import get_chroma_engine, ChromaSchemaEngine, get_embedding_synchronizer, sync_chroma_from_postgres
 from src.rag.config import CHROMA_DATA_DIR, CHROMA_COLLECTION_NAME
 
 
@@ -113,7 +112,7 @@ class TestChromaDBIntegration(unittest.TestCase):
         Verify search_active_segments in embedding_sync resolves vectors
         from ChromaDB with full PostgreSQL segment integrity.
         """
-        syncer = get_faiss_synchronizer()
+        syncer = get_embedding_synchronizer()
         results = syncer.search_active_segments(
             query="patient appointments and prescriptions",
             top_k=3,

@@ -177,11 +177,12 @@ def run_tests():
     print(f"BENCHMARK SUMMARY: {total_passed} / {total_executed} SCENARIOS PASSED ({(total_passed/total_executed)*100:.1f}%)")
     print("=" * 80)
 
-    # Save benchmark json artifact
-    out_file = BASE_DIR / "scripts" / "benchmark_results.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(results_table, f, indent=2)
-    print(f"Results JSON written to {out_file}")
+    # Save benchmark json artifact if explicitly requested via --save
+    if "--save" in sys.argv:
+        out_file = BASE_DIR / "tests" / "benchmark_results.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(results_table, f, indent=2)
+        print(f"Results JSON written to {out_file}")
 
 if __name__ == "__main__":
     run_tests()

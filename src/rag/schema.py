@@ -43,7 +43,6 @@ class RAGSchemaResponse(BaseModel):
     intent: str = Field(default="SCHEMA", description="Detected intent: SCHEMA or RELATED")
     needs_clarification: bool = Field(default=False, description="Whether clarification is required")
 
-    # Dict-like compatibility for legacy indexing (e.g., res.get("sql") or res["sql"])
     def __getitem__(self, item: str):
         return getattr(self, item)
 
@@ -52,4 +51,3 @@ class RAGSchemaResponse(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
-
