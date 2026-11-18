@@ -1,5 +1,8 @@
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
+from src.config import get_logger
+
+logger = get_logger(__name__)
 
 
 class TableSchema(BaseModel):
@@ -10,6 +13,13 @@ class TableSchema(BaseModel):
     sql: str = Field(..., description="DDL statement to create the table and its constraints")
     columns: Optional[List[Dict[str, Any]]] = Field(default=None, description="Optional column specifications")
 
+    def to_dict(self) -> Dict[str, Any]:
+        try:
+            return self.model_dump()
+        except Exception as e:
+            logger.error(f"Error serializing TableSchema to dict: {e}")
+            return {"table_name": self.table_name, "sql": self.sql}
+
 
 class RAGQueryRequest(BaseModel):
     query: str = Field(..., description="Natural language query requesting ERP schema tables")
@@ -19,11 +29,15 @@ class RAGQueryRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def resolve_aliases(cls, values: dict):
-        if not isinstance(values, dict):
+        try:
+            if not isinstance(values, dict):
+                return values
+            q = values.get("query") or values.get("prompt") or values.get("user_query") or ""
+            values["query"] = str(q).strip()
             return values
-        q = values.get("query") or values.get("prompt") or values.get("user_query") or ""
-        values["query"] = q
-        return values
+        except Exception as e:
+            logger.warning(f"Error resolving aliases for RAGQueryRequest: {e}")
+            return values
 
 
 class RAGSchemaResponse(BaseModel):
@@ -44,10 +58,29 @@ class RAGSchemaResponse(BaseModel):
     needs_clarification: bool = Field(default=False, description="Whether clarification is required")
 
     def __getitem__(self, item: str):
-        return getattr(self, item)
+        try:
+            return getattr(self, item)
+        except AttributeError as e:
+            logger.error(f"Attribute '{item}' not found on RAGSchemaResponse: {e}")
+            raise
 
     def get(self, item: str, default: Any = None):
-        return getattr(self, item, default)
+        try:
+            return getattr(self, item, default)
+        except Exception as e:
+            logger.warning(f"Error accessing attribute '{item}' on RAGSchemaResponse: {e}")
+            return default
 
     def to_dict(self) -> Dict[str, Any]:
-        return self.model_dump()
+        try:
+            return self.model_dump()
+        except Exception as e:
+            logger.error(f"Error dumping RAGSchemaResponse to dict: {e}")
+            return {
+                "domain": self.domain,
+                "domain_name": self.domain_name,
+                "tables": self.tables,
+                "sql": self.sql,
+                "count": self.count,
+                "status": self.status,
+            }

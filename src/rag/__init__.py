@@ -1,6 +1,10 @@
 """
 Enterprise RAG Knowledge Base and Vector Search Package.
 """
+from src.config import get_logger
+
+logger = get_logger(__name__)
+
 from src.rag.config import (
     DATABASE_URL,
     USE_POSTGRES_KB,
@@ -45,7 +49,6 @@ from src.rag.database import (
     init_db,
     KnowledgeBaseRepository,
     JSONKnowledgeBaseMigrator,
-    compute_sha256,
     generate_stable_segment_uuid,
     KnowledgeChunk,
     build_domain_chunk,
@@ -67,6 +70,7 @@ from src.rag.service import (
     ChromaPostgresSynchronizer,
     get_embedding_synchronizer,
     sync_chroma_from_postgres,
+    auto_sync_chroma,
 )
 
 __all__ = [
@@ -88,6 +92,7 @@ __all__ = [
     "ChromaPostgresSynchronizer",
     "get_embedding_synchronizer",
     "sync_chroma_from_postgres",
+    "auto_sync_chroma",
     # Database & DAL
     "get_engine",
     "get_session",
@@ -97,7 +102,6 @@ __all__ = [
     "KnowledgeBaseRepository",
     "JSONKnowledgeBaseMigrator",
     # Chunking
-    "compute_sha256",
     "generate_stable_segment_uuid",
     "KnowledgeChunk",
     "build_domain_chunk",

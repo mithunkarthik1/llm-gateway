@@ -1,9 +1,12 @@
-import hashlib
+"""
+Production Database Engine, Session Management, Repository, and Migration Loader
+for PostgreSQL Knowledge Base (Primary Source of Truth).
+"""
 import json
 import logging
-import os
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
@@ -27,6 +30,8 @@ from src.rag.config import (
     DB_MAX_OVERFLOW,
     DB_POOL_TIMEOUT,
     DB_POOL_RECYCLE,
+    DOMAINS_DATA_DIR,
+    EMBEDDING_MODEL_NAME,
 )
 from src.rag.models import (
     Base,
@@ -37,7 +42,6 @@ from src.rag.models import (
     KnowledgeSegmentModel,
     SegmentVersionModel,
     EmbeddingJobModel,
-    SegmentVectorModel,
     generate_uuid,
     utc_now,
 )
@@ -53,50 +57,65 @@ _SESSION_FACTORY = None
 
 
 def get_engine(db_url: Optional[str] = None):
-    """
-    Returns a configured SQLAlchemy engine singleton.
-    Supports PostgreSQL with connection pooling and SQLite for test isolation.
-    """
+    """Returns singleton SQLAlchemy Engine with robust connection pooling."""
     global _ENGINE, _SESSION_FACTORY
     target_url = db_url or DATABASE_URL
 
-    if _ENGINE is None or (db_url and str(_ENGINE.url) != db_url):
-        if target_url.startswith("sqlite"):
-            _ENGINE = create_engine(
-                target_url,
-                connect_args={"check_same_thread": False},
-                poolclass=StaticPool
+    if _ENGINE is None:
+        if not target_url:
+            logger.error("DATABASE_URL is not configured in environment or .env file.")
+            raise ValueError("DATABASE_URL is not configured in environment or .env file.")
+
+        try:
+            masked_url = target_url
+            if "@" in target_url and ":" in target_url.split("@")[0]:
+                prefix = target_url.split("@")[0]
+                masked_url = prefix.split(":")[0] + ":***@" + target_url.split("@")[1]
+
+            logger.info(f"Initialized Database engine for: {masked_url}")
+
+            if target_url.startswith("sqlite"):
+                _ENGINE = create_engine(
+                    target_url,
+                    connect_args={"check_same_thread": False},
+                    poolclass=StaticPool,
+                )
+            else:
+                _ENGINE = create_engine(
+                    target_url,
+                    poolclass=QueuePool,
+                    pool_size=DB_POOL_SIZE,
+                    max_overflow=DB_MAX_OVERFLOW,
+                    pool_timeout=DB_POOL_TIMEOUT,
+                    pool_recycle=DB_POOL_RECYCLE,
+                    pool_pre_ping=True,
+                )
+
+            _SESSION_FACTORY = scoped_session(
+                sessionmaker(autocommit=False, autoflush=False, bind=_ENGINE)
             )
-        else:
-            _ENGINE = create_engine(
-                target_url,
-                poolclass=QueuePool,
-                pool_size=DB_POOL_SIZE,
-                max_overflow=DB_MAX_OVERFLOW,
-                pool_timeout=DB_POOL_TIMEOUT,
-                pool_recycle=DB_POOL_RECYCLE,
-                pool_pre_ping=True
-            )
-        _SESSION_FACTORY = scoped_session(
-            sessionmaker(autocommit=False, autoflush=False, bind=_ENGINE)
-        )
-        logger.info(f"Initialized Database engine for: {_ENGINE.url.render_as_string(hide_password=True)}")
+        except Exception as e:
+            logger.error(f"Failed to create database engine: {e}")
+            raise
 
     return _ENGINE
 
 
 def get_session(db_url: Optional[str] = None) -> Session:
-    """Returns a new database session."""
-    get_engine(db_url)
-    return _SESSION_FACTORY()
+    """Creates a new SQLAlchemy session."""
+    global _SESSION_FACTORY
+    try:
+        if _SESSION_FACTORY is None:
+            get_engine(db_url)
+        return _SESSION_FACTORY()
+    except Exception as e:
+        logger.error(f"Failed to create database session: {e}")
+        raise
 
 
 @contextmanager
 def get_db(db_url: Optional[str] = None) -> Generator[Session, None, None]:
-    """
-    Context manager providing a transactional database session with
-    automatic commit on success and rollback on exceptions.
-    """
+    """Context manager for transactional database sessions with automatic rollback."""
     session = get_session(db_url)
     try:
         yield session
@@ -110,11 +129,11 @@ def get_db(db_url: Optional[str] = None) -> Generator[Session, None, None]:
 
 
 def is_db_connected(db_url: Optional[str] = None) -> bool:
-    """Verifies live database connectivity."""
+    """Verifies live PostgreSQL database connectivity."""
     try:
         engine = get_engine(db_url)
         with engine.connect() as conn:
-            conn.execute(text("SELECT 1;"))
+            conn.execute(text("SELECT 1"))
         return True
     except Exception as e:
         logger.warning(f"Database connectivity check failed: {e}")
@@ -123,215 +142,243 @@ def is_db_connected(db_url: Optional[str] = None) -> bool:
 
 def init_db(db_url: Optional[str] = None, drop_all: bool = False):
     """Initializes all database tables from models metadata."""
-    engine = get_engine(db_url)
-    if drop_all:
-        logger.warning("Dropping all existing knowledge base tables...")
-        Base.metadata.drop_all(bind=engine)
-    logger.info("Creating knowledge base tables if not present...")
-    Base.metadata.create_all(bind=engine)
-    logger.info("Knowledge base tables initialized successfully.")
+    try:
+        engine = get_engine(db_url)
+        if drop_all:
+            logger.warning("Dropping all existing knowledge base tables...")
+            Base.metadata.drop_all(bind=engine)
+        logger.info("Creating knowledge base tables if not present...")
+        Base.metadata.create_all(bind=engine)
+
+        # Auto-migrate segment_key column and drop legacy content_hash columns
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE knowledge_segments ADD COLUMN IF NOT EXISTS segment_key VARCHAR(256);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_knowledge_segments_segment_key ON knowledge_segments(segment_key);"))
+                conn.execute(text("ALTER TABLE knowledge_tables DROP COLUMN IF EXISTS content_hash;"))
+                conn.execute(text("ALTER TABLE knowledge_segments DROP COLUMN IF EXISTS content_hash;"))
+                conn.execute(text("ALTER TABLE segment_versions DROP COLUMN IF EXISTS content_hash;"))
+                conn.execute(text("ALTER TABLE embedding_jobs DROP COLUMN IF EXISTS content_hash;"))
+                conn.execute(text("ALTER TABLE segment_vectors DROP COLUMN IF EXISTS content_hash;"))
+        except Exception as e:
+            logger.debug(f"Column migration check note: {e}")
+
+        logger.info("Knowledge base tables initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize database tables: {e}")
+        raise
 
 
 # =============================================================================
-# Chunking & Hashing Utilities
+# Chunking Data Structure & Semantic Builders (Key-Driven)
 # =============================================================================
 
 SEGMENT_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
 
-def compute_sha256(text: str) -> str:
-    """Computes normalized SHA-256 hash of text content."""
-    clean = text.strip().encode("utf-8")
-    return hashlib.sha256(clean).hexdigest()
-
-
 def generate_stable_segment_uuid(domain_id: str, topic: str, segment_name: str) -> uuid.UUID:
-    """
-    Generates a deterministic, collision-free UUIDv5 for a logical segment identity.
-    Ensures that a segment retains its exact UUID across multiple content updates.
-    """
+    """Generates a deterministic, collision-free UUIDv5 for a logical segment identity."""
     identity_key = f"{domain_id.lower().strip()}:{topic.lower().strip()}:{segment_name.lower().strip()}"
     return uuid.uuid5(SEGMENT_NAMESPACE, identity_key)
 
 
+@dataclass
 class KnowledgeChunk:
     """Represents a structured hybrid chunk ready for DB persistence & vectorization."""
+    segment_uuid: uuid.UUID
+    domain_id: str
+    section: str
+    topic: str
+    segment_type: str
+    segment_name: str
+    content: str
+    table_name: Optional[str] = None
+    segment_key: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def __init__(
-        self,
-        segment_uuid: uuid.UUID,
-        domain_id: str,
-        section: str,
-        topic: str,
-        segment_type: str,
-        segment_name: str,
-        content: str,
-        table_name: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ):
-        self.segment_uuid = segment_uuid
-        self.domain_id = domain_id
-        self.section = section
-        self.topic = topic
-        self.segment_type = segment_type
-        self.segment_name = segment_name
-        self.content = content.strip()
-        self.content_hash = compute_sha256(self.content)
-        self.table_name = table_name
-        self.metadata = metadata or {}
+    def __post_init__(self):
+        self.content = self.content.strip()
+        if not self.segment_key:
+            self.segment_key = (
+                self.metadata.get("identity_key")
+                or f"{self.domain_id}:{self.table_name or 'none'}:{self.segment_name}"
+            )
+        self.metadata["segment_key"] = self.segment_key
+        self.metadata["identity_key"] = self.segment_key
 
 
 def build_domain_chunk(domain_data: Dict[str, Any]) -> KnowledgeChunk:
     """Builds a domain-level hybrid segment."""
-    dom_id = domain_data.get("domain_id", "").strip()
-    dom_name = domain_data.get("domain_name", dom_id).strip()
-    system = domain_data.get("system", "Enterprise ERP").strip()
-    desc = domain_data.get("description", "").strip()
-    keywords = domain_data.get("keywords", [])
-    tbls = domain_data.get("table_names", [])
+    try:
+        dom_id = domain_data.get("domain_id", "").strip()
+        dom_name = domain_data.get("domain_name", dom_id).strip()
+        system = domain_data.get("system", "Enterprise ERP").strip()
+        desc = domain_data.get("description", "").strip()
+        keywords = domain_data.get("keywords", [])
+        tbls = domain_data.get("table_names", [])
 
-    section = dom_name
-    topic = f"{dom_name} Overview"
-    seg_name = f"{dom_id}.overview"
-    seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
+        section = dom_name
+        topic = f"{dom_name} Overview"
+        seg_name = f"{dom_id}.overview"
+        seg_key = f"{dom_id}:domain:overview"
+        seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
 
-    content = (
-        f"Section: {section}\n"
-        f"Topic: {topic}\n"
-        f"Segment: {seg_name}\n\n"
-        f"System: {system}\n"
-        f"Domain ID: {dom_id}\n"
-        f"Domain Name: {dom_name}\n"
-        f"Description: {desc}\n"
-        f"Master Tables: {', '.join(tbls)}\n"
-        f"Keywords: {', '.join(keywords)}"
-    )
+        content = (
+            f"Section: {section}\n"
+            f"Topic: {topic}\n"
+            f"Segment: {seg_name}\n\n"
+            f"System: {system}\n"
+            f"Domain ID: {dom_id}\n"
+            f"Domain Name: {dom_name}\n"
+            f"Description: {desc}\n"
+            f"Master Tables: {', '.join(tbls)}\n"
+            f"Keywords: {', '.join(keywords)}"
+        )
 
-    return KnowledgeChunk(
-        segment_uuid=seg_uuid,
-        domain_id=dom_id,
-        section=section,
-        topic=topic,
-        segment_type="domain",
-        segment_name=seg_name,
-        content=content,
-        metadata={
-            "domain_id": dom_id,
-            "domain_name": dom_name,
-            "segment_type": "domain",
-            "identity_key": f"{dom_id}:domain:overview",
-            "table_count": len(tbls)
-        }
-    )
+        return KnowledgeChunk(
+            segment_uuid=seg_uuid,
+            domain_id=dom_id,
+            section=section,
+            topic=topic,
+            segment_type="domain",
+            segment_name=seg_name,
+            segment_key=seg_key,
+            content=content,
+            metadata={
+                "domain_id": dom_id,
+                "domain_name": dom_name,
+                "segment_type": "domain",
+                "segment_key": seg_key,
+                "identity_key": seg_key,
+                "table_count": len(tbls)
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error building domain chunk: {e}")
+        raise
 
 
 def build_table_chunk(domain_data: Dict[str, Any], table_data: Dict[str, Any]) -> KnowledgeChunk:
     """Builds a table-level hybrid segment."""
-    dom_id = domain_data.get("domain_id", "").strip()
-    dom_name = domain_data.get("domain_name", dom_id).strip()
-    system = domain_data.get("system", "Enterprise ERP").strip()
-    tname = table_data.get("table_name", "").strip()
-    desc = table_data.get("description", "").strip()
-    keywords = table_data.get("keywords", [])
-    deps = table_data.get("dependencies", [])
-    cols = table_data.get("columns", [])
-    raw_sql = table_data.get("sql", "").strip()
+    try:
+        dom_id = domain_data.get("domain_id", "").strip()
+        dom_name = domain_data.get("domain_name", dom_id).strip()
+        system = domain_data.get("system", "Enterprise ERP").strip()
+        tname = table_data.get("table_name", "").strip()
+        desc = table_data.get("description", "").strip()
+        keywords = table_data.get("keywords", [])
+        deps = table_data.get("dependencies", [])
+        cols = table_data.get("columns", [])
+        raw_sql = table_data.get("sql", "").strip()
 
-    section = dom_name
-    topic = tname.replace("_", " ").title()
-    seg_name = f"{tname}.table_definition"
-    seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
+        section = dom_name
+        topic = tname.replace("_", " ").title()
+        seg_name = f"{tname}.table_definition"
+        seg_key = f"{dom_id}:{tname}:definition"
+        seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
 
-    content = (
-        f"Section: {section}\n"
-        f"Topic: {topic}\n"
-        f"Segment: {seg_name}\n\n"
-        f"System: {system}\n"
-        f"Domain: {dom_name} ({dom_id})\n"
-        f"Table: {tname}\n"
-        f"Description: {desc}\n"
-        f"Foreign Key Dependencies: {', '.join(deps) if deps else 'None'}\n"
-        f"Columns: {', '.join(cols)}\n"
-        f"Keywords: {', '.join(keywords)}\n\n"
-        f"SQL Definition:\n{raw_sql}"
-    )
+        content = (
+            f"Section: {section}\n"
+            f"Topic: {topic}\n"
+            f"Segment: {seg_name}\n\n"
+            f"System: {system}\n"
+            f"Domain: {dom_name} ({dom_id})\n"
+            f"Table: {tname}\n"
+            f"Description: {desc}\n"
+            f"Foreign Key Dependencies: {', '.join(deps) if deps else 'None'}\n"
+            f"Columns: {', '.join(cols)}\n"
+            f"Keywords: {', '.join(keywords)}\n\n"
+            f"SQL Definition:\n{raw_sql}"
+        )
 
-    return KnowledgeChunk(
-        segment_uuid=seg_uuid,
-        domain_id=dom_id,
-        section=section,
-        topic=topic,
-        segment_type="table",
-        segment_name=seg_name,
-        content=content,
-        table_name=tname,
-        metadata={
-            "domain_id": dom_id,
-            "domain_name": dom_name,
-            "table_name": tname,
-            "segment_type": "table",
-            "identity_key": f"{dom_id}:{tname}:definition",
-            "dependencies": deps
-        }
-    )
+        return KnowledgeChunk(
+            segment_uuid=seg_uuid,
+            domain_id=dom_id,
+            section=section,
+            topic=topic,
+            segment_type="table",
+            segment_name=seg_name,
+            segment_key=seg_key,
+            content=content,
+            table_name=tname,
+            metadata={
+                "domain_id": dom_id,
+                "domain_name": dom_name,
+                "table_name": tname,
+                "segment_type": "table",
+                "segment_key": seg_key,
+                "identity_key": seg_key,
+                "dependencies": deps
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error building table chunk: {e}")
+        raise
 
 
 def build_column_chunk(domain_data: Dict[str, Any], column_data: Dict[str, Any]) -> KnowledgeChunk:
     """Builds a granular column-level hybrid segment."""
-    dom_id = domain_data.get("domain_id", "").strip()
-    dom_name = domain_data.get("domain_name", dom_id).strip()
+    try:
+        dom_id = domain_data.get("domain_id", "").strip()
+        dom_name = domain_data.get("domain_name", dom_id).strip()
 
-    tname = column_data.get("table_name", "").strip()
-    cname = column_data.get("column_name", "").strip()
-    dtype = column_data.get("data_type", "").strip()
-    cdesc = column_data.get("description", "").strip()
-    ckw = column_data.get("keywords", [])
-    is_pk = column_data.get("is_primary_key", False)
-    is_fk = column_data.get("is_foreign_key", False)
-    ref = column_data.get("references")
+        tname = column_data.get("table_name", "").strip()
+        cname = column_data.get("column_name", "").strip()
+        dtype = column_data.get("data_type", "").strip()
+        cdesc = column_data.get("description", "").strip()
+        ckw = column_data.get("keywords", [])
+        is_pk = column_data.get("is_primary_key", False)
+        is_fk = column_data.get("is_foreign_key", False)
+        ref = column_data.get("references")
 
-    section = dom_name
-    topic = tname.replace("_", " ").title()
-    seg_name = f"{tname}.{cname}"
-    seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
+        section = dom_name
+        topic = tname.replace("_", " ").title()
+        seg_name = f"{tname}.{cname}"
+        seg_key = f"{dom_id}:{tname}:{cname}"
+        seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
 
-    pk_str = "Yes" if is_pk else "No"
-    fk_str = f"Yes (References: {ref})" if is_fk else "No"
+        pk_str = "Yes" if is_pk else "No"
+        fk_str = f"Yes (References: {ref})" if is_fk else "No"
 
-    content = (
-        f"Section: {section}\n"
-        f"Topic: {topic}\n"
-        f"Segment: {seg_name}\n\n"
-        f"Table: {tname}\n"
-        f"Column: {cname}\n"
-        f"Data Type: {dtype}\n"
-        f"Primary Key: {pk_str}\n"
-        f"Foreign Key: {fk_str}\n"
-        f"Description: {cdesc}\n"
-        f"Keywords: {', '.join(ckw) if ckw else cname}"
-    )
+        content = (
+            f"Section: {section}\n"
+            f"Topic: {topic}\n"
+            f"Segment: {seg_name}\n\n"
+            f"Table: {tname}\n"
+            f"Column: {cname}\n"
+            f"Data Type: {dtype}\n"
+            f"Primary Key: {pk_str}\n"
+            f"Foreign Key: {fk_str}\n"
+            f"Description: {cdesc}\n"
+            f"Keywords: {', '.join(ckw) if ckw else cname}"
+        )
 
-    return KnowledgeChunk(
-        segment_uuid=seg_uuid,
-        domain_id=dom_id,
-        section=section,
-        topic=topic,
-        segment_type="column",
-        segment_name=seg_name,
-        content=content,
-        table_name=tname,
-        metadata={
-            "domain_id": dom_id,
-            "domain_name": dom_name,
-            "table_name": tname,
-            "column_name": cname,
-            "data_type": dtype,
-            "is_primary_key": is_pk,
-            "is_foreign_key": is_fk,
-            "segment_type": "column",
-            "identity_key": f"{dom_id}:{tname}:{cname}"
-        }
-    )
+        return KnowledgeChunk(
+            segment_uuid=seg_uuid,
+            domain_id=dom_id,
+            section=section,
+            topic=topic,
+            segment_type="column",
+            segment_name=seg_name,
+            segment_key=seg_key,
+            content=content,
+            table_name=tname,
+            metadata={
+                "domain_id": dom_id,
+                "domain_name": dom_name,
+                "table_name": tname,
+                "column_name": cname,
+                "data_type": dtype,
+                "is_primary_key": is_pk,
+                "is_foreign_key": is_fk,
+                "segment_type": "column",
+                "segment_key": seg_key,
+                "identity_key": seg_key
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error building column chunk: {e}")
+        raise
 
 
 def build_relationship_chunk(
@@ -342,54 +389,60 @@ def build_relationship_chunk(
     rel_type: str = "FOREIGN_KEY"
 ) -> KnowledgeChunk:
     """Builds a relational foreign-key dependency hybrid segment."""
-    dom_id = domain_data.get("domain_id", "").strip()
-    dom_name = domain_data.get("domain_name", dom_id).strip()
+    try:
+        dom_id = domain_data.get("domain_id", "").strip()
+        dom_name = domain_data.get("domain_name", dom_id).strip()
 
-    section = dom_name
-    topic = source_table.replace("_", " ").title()
-    seg_name = f"{source_table}.ref_{target_table}"
-    seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
+        section = dom_name
+        topic = source_table.replace("_", " ").title()
+        seg_name = f"{source_table}.ref_{target_table}"
+        seg_key = f"{dom_id}:{source_table}:ref_{target_table}"
+        seg_uuid = generate_stable_segment_uuid(dom_id, topic, seg_name)
 
-    content = (
-        f"Section: {section}\n"
-        f"Topic: {topic}\n"
-        f"Segment: {seg_name}\n\n"
-        f"Source Table: {source_table}\n"
-        f"Foreign Key Column: {fk_col}\n"
-        f"Referenced Parent Table: {target_table}\n"
-        f"Relationship Type: {rel_type}\n"
-        f"Relational Rule: Table '{source_table}' directly depends on parent table '{target_table}' via key '{fk_col}'."
-    )
+        content = (
+            f"Section: {section}\n"
+            f"Topic: {topic}\n"
+            f"Segment: {seg_name}\n\n"
+            f"Source Table: {source_table}\n"
+            f"Foreign Key Column: {fk_col}\n"
+            f"Referenced Parent Table: {target_table}\n"
+            f"Relationship Type: {rel_type}\n"
+            f"Relational Rule: Table '{source_table}' directly depends on parent table '{target_table}' via key '{fk_col}'."
+        )
 
-    return KnowledgeChunk(
-        segment_uuid=seg_uuid,
-        domain_id=dom_id,
-        section=section,
-        topic=topic,
-        segment_type="relationship",
-        segment_name=seg_name,
-        content=content,
-        table_name=source_table,
-        metadata={
-            "domain_id": dom_id,
-            "domain_name": dom_name,
-            "source_table": source_table,
-            "referenced_table": target_table,
-            "fk_column": fk_col,
-            "segment_type": "relationship",
-            "identity_key": f"{dom_id}:{source_table}:ref_{target_table}"
-        }
-    )
+        return KnowledgeChunk(
+            segment_uuid=seg_uuid,
+            domain_id=dom_id,
+            section=section,
+            topic=topic,
+            segment_type="relationship",
+            segment_name=seg_name,
+            segment_key=seg_key,
+            content=content,
+            table_name=source_table,
+            metadata={
+                "domain_id": dom_id,
+                "domain_name": dom_name,
+                "source_table": source_table,
+                "referenced_table": target_table,
+                "fk_column": fk_col,
+                "segment_type": "relationship",
+                "segment_key": seg_key,
+                "identity_key": seg_key
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error building relationship chunk: {e}")
+        raise
 
 
 # =============================================================================
-# Unified Repository Data Access Layer
+# Knowledge Base Repository (Clean 2-Tier CRUD without Hashing)
 # =============================================================================
 
 class KnowledgeBaseRepository:
     """
-    Unified Data Access Layer for PostgreSQL ERP Knowledge Base.
-    Provides fast, transactional, zero-N+1 query operations.
+    Data Access Layer providing CRUD and 2-tier search/alteration operations.
     """
 
     def __init__(self, session: Session):
@@ -409,7 +462,7 @@ class KnowledgeBaseRepository:
         q = self.session.query(DomainModel)
         if active_only:
             q = q.filter(DomainModel.is_active.is_(True))
-        return q.order_by(DomainModel.domain_id).all()
+        return q.order_by(DomainModel.domain_name).all()
 
     def upsert_domain(
         self,
@@ -420,8 +473,8 @@ class KnowledgeBaseRepository:
         keywords: Optional[List[str]] = None,
         is_active: bool = True
     ) -> Tuple[DomainModel, bool]:
-        dom_id_clean = domain_id.lower().strip()
-        existing = self.session.query(DomainModel).filter(DomainModel.domain_id == dom_id_clean).first()
+        dom_clean = domain_id.lower().strip()
+        existing = self.session.query(DomainModel).filter(DomainModel.domain_id == dom_clean).first()
         if existing:
             existing.domain_name = domain_name
             existing.system_name = system_name
@@ -432,12 +485,12 @@ class KnowledgeBaseRepository:
             return existing, False
 
         new_domain = DomainModel(
-            domain_id=dom_id_clean,
+            domain_id=dom_clean,
             domain_name=domain_name,
             system_name=system_name,
             description=description,
             keywords=keywords or [],
-            is_active=is_active,
+            is_active=is_active
         )
         self.session.add(new_domain)
         self.session.flush()
@@ -448,12 +501,16 @@ class KnowledgeBaseRepository:
         return self.session.query(KnowledgeTableModel).filter(KnowledgeTableModel.id == table_uuid).first()
 
     def get_table_by_name(self, table_name: str, domain_id: Optional[str] = None) -> Optional[KnowledgeTableModel]:
-        tname = table_name.lower().strip()
-        q = self.session.query(KnowledgeTableModel).filter(KnowledgeTableModel.table_name == tname)
+        q = self.session.query(KnowledgeTableModel).filter(
+            KnowledgeTableModel.table_name == table_name.lower().strip(),
+            KnowledgeTableModel.is_active.is_(True)
+        )
         if domain_id:
             dom = self.get_domain_by_business_id(domain_id, active_only=False)
             if dom:
                 q = q.filter(KnowledgeTableModel.domain_id == dom.id)
+            else:
+                return None
         return q.first()
 
     def list_tables(self, domain_id: Optional[str] = None, active_only: bool = True) -> List[KnowledgeTableModel]:
@@ -473,7 +530,6 @@ class KnowledgeBaseRepository:
         domain_uuid: uuid.UUID,
         table_name: str,
         sql_definition: str,
-        content_hash: str,
         description: Optional[str] = None,
         keywords: Optional[List[str]] = None,
         is_active: bool = True
@@ -486,7 +542,6 @@ class KnowledgeBaseRepository:
 
         if existing:
             existing.sql_definition = sql_definition
-            existing.content_hash = content_hash
             existing.description = description
             existing.keywords = keywords or []
             existing.is_active = is_active
@@ -497,7 +552,6 @@ class KnowledgeBaseRepository:
             domain_id=domain_uuid,
             table_name=tname_clean,
             sql_definition=sql_definition,
-            content_hash=content_hash,
             description=description,
             keywords=keywords or [],
             is_active=is_active
@@ -511,7 +565,7 @@ class KnowledgeBaseRepository:
         q = self.session.query(KnowledgeColumnModel).filter(KnowledgeColumnModel.table_id == table_uuid)
         if active_only:
             q = q.filter(KnowledgeColumnModel.is_active.is_(True))
-        return q.order_by(KnowledgeColumnModel.id).all()
+        return q.order_by(KnowledgeColumnModel.column_name).all()
 
     def upsert_column(
         self,
@@ -537,8 +591,8 @@ class KnowledgeBaseRepository:
             existing.description = description
             existing.is_primary_key = is_primary_key
             existing.is_foreign_key = is_foreign_key
-            existing.references_table = references_table
-            existing.references_column = references_column
+            existing.references_table = references_table.lower().strip() if references_table else None
+            existing.references_column = references_column.lower().strip() if references_column else None
             existing.keywords = keywords or []
             existing.is_active = is_active
             existing.updated_at = utc_now()
@@ -551,8 +605,8 @@ class KnowledgeBaseRepository:
             description=description,
             is_primary_key=is_primary_key,
             is_foreign_key=is_foreign_key,
-            references_table=references_table,
-            references_column=references_column,
+            references_table=references_table.lower().strip() if references_table else None,
+            references_column=references_column.lower().strip() if references_column else None,
             keywords=keywords or [],
             is_active=is_active
         )
@@ -569,8 +623,7 @@ class KnowledgeBaseRepository:
     ) -> Tuple[TableDependencyModel, bool]:
         existing = self.session.query(TableDependencyModel).filter(
             TableDependencyModel.source_table_id == source_table_id,
-            TableDependencyModel.referenced_table_id == referenced_table_id,
-            TableDependencyModel.relationship_type == relationship_type
+            TableDependencyModel.referenced_table_id == referenced_table_id
         ).first()
         if existing:
             return existing, False
@@ -589,9 +642,17 @@ class KnowledgeBaseRepository:
             TableDependencyModel.source_table_id == table_id
         ).all()
 
-    # 5. Knowledge Segments (Hybrid Chunks)
+    # 5. Knowledge Segments (2-Tier: segment_id + segment_key)
     def get_segment_by_id(self, segment_uuid: uuid.UUID) -> Optional[KnowledgeSegmentModel]:
+        """Tier 1: Direct point lookup by permanent UUID."""
         return self.session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.id == segment_uuid).first()
+
+    def get_segment_by_key(self, segment_key: str, active_only: bool = True) -> Optional[KnowledgeSegmentModel]:
+        """Tier 2: Business lookup by structured segment_key (domain:table:column)."""
+        q = self.session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.segment_key == segment_key)
+        if active_only:
+            q = q.filter(KnowledgeSegmentModel.is_active.is_(True))
+        return q.first()
 
     def list_active_segments(
         self,
@@ -618,28 +679,38 @@ class KnowledgeBaseRepository:
         segment_type: str,
         segment_name: str,
         content: str,
-        content_hash: str,
+        segment_key: Optional[str] = None,
         is_active: bool = True
     ) -> Tuple[KnowledgeSegmentModel, str]:
-        existing = self.session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.id == segment_uuid).first()
+        """2-Tier Resolution: Search by segment_key first if provided, else by permanent UUID."""
+        existing = None
+        if segment_key:
+            existing = self.session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.segment_key == segment_key).first()
+        if not existing and segment_uuid:
+            existing = self.session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.id == segment_uuid).first()
 
         if existing:
-            if existing.content_hash == content_hash and existing.is_active == is_active:
+            # Change detection directly on content without hashing
+            content_changed = (existing.content.strip() != content.strip())
+            key_changed = (segment_key is not None and existing.segment_key != segment_key)
+            status_changed = (existing.is_active != is_active)
+
+            if not content_changed and not key_changed and not status_changed:
                 return existing, "NONE"
 
             self.archive_segment_version(
                 segment_id=existing.id,
                 version=existing.version,
-                content=existing.content,
-                content_hash=existing.content_hash
+                content=existing.content
             )
 
             existing.section = section
             existing.topic = topic
             existing.segment_type = segment_type
             existing.segment_name = segment_name
+            if segment_key:
+                existing.segment_key = segment_key
             existing.content = content
-            existing.content_hash = content_hash
             existing.version += 1
             existing.is_active = is_active
             existing.updated_at = utc_now()
@@ -653,8 +724,8 @@ class KnowledgeBaseRepository:
             topic=topic,
             segment_type=segment_type,
             segment_name=segment_name,
+            segment_key=segment_key,
             content=content,
-            content_hash=content_hash,
             version=1,
             is_active=is_active
         )
@@ -662,12 +733,51 @@ class KnowledgeBaseRepository:
         self.session.flush()
         return new_segment, "INSERT"
 
+    def alter_segment(
+        self,
+        segment_id: uuid.UUID,
+        new_content: str,
+        new_segment_key: Optional[str] = None
+    ) -> Tuple[KnowledgeSegmentModel, str]:
+        """
+        Tier 1: Direct in-place mutation by permanent segment_id.
+        Removes reliance on content hash for finding or updating segments.
+        """
+        seg = self.get_segment_by_id(segment_id)
+        if not seg:
+            raise ValueError(f"Knowledge segment with ID '{segment_id}' not found.")
+
+        content_changed = (seg.content.strip() != new_content.strip())
+        key_changed = (new_segment_key is not None and seg.segment_key != new_segment_key)
+
+        if not content_changed and not key_changed:
+            return seg, "NONE"
+
+        self.archive_segment_version(
+            segment_id=seg.id,
+            version=seg.version,
+            content=seg.content
+        )
+
+        seg.content = new_content.strip()
+        seg.version += 1
+        if new_segment_key:
+            seg.segment_key = new_segment_key
+        seg.updated_at = utc_now()
+
+        # Enqueue ChromaDB synchronization job
+        self.create_embedding_job(
+            segment_id=seg.id,
+            operation="UPDATE"
+        )
+        self.session.flush()
+        return seg, "UPDATE"
+
     def archive_segment_version(
         self,
         segment_id: uuid.UUID,
         version: int,
-        content: str,
-        content_hash: str
+        content: str
     ) -> SegmentVersionModel:
         existing = self.session.query(SegmentVersionModel).filter(
             SegmentVersionModel.segment_id == segment_id,
@@ -680,7 +790,6 @@ class KnowledgeBaseRepository:
             segment_id=segment_id,
             version=version,
             content=content,
-            content_hash=content_hash,
             changed_at=utc_now()
         )
         self.session.add(version_record)
@@ -692,16 +801,14 @@ class KnowledgeBaseRepository:
             SegmentVersionModel.segment_id == segment_id
         ).order_by(SegmentVersionModel.version.desc()).all()
 
-    # 6. Embedding Jobs
+    # 6. Embedding Jobs (Asynchronous Synchronization Queue)
     def create_embedding_job(
         self,
         segment_id: uuid.UUID,
-        content_hash: str,
-        operation: str
+        operation: str = "INSERT"
     ) -> EmbeddingJobModel:
         job = EmbeddingJobModel(
             segment_id=segment_id,
-            content_hash=content_hash,
             operation=operation,
             status="PENDING",
             created_at=utc_now()
@@ -730,60 +837,9 @@ class KnowledgeBaseRepository:
             if status == "FAILED":
                 job.retry_count += 1
 
-    # 7. Segment Vectors
-    def upsert_segment_vector(
-        self,
-        segment_id: uuid.UUID,
-        embedding_model: str,
-        faiss_vector_id: int,
-        content_hash: str,
-        model_version: str = "v1"
-    ) -> SegmentVectorModel:
-        existing = self.session.query(SegmentVectorModel).filter(
-            SegmentVectorModel.embedding_model == embedding_model,
-            SegmentVectorModel.segment_id == segment_id
-        ).first()
-
-        if existing:
-            existing.faiss_vector_id = faiss_vector_id
-            existing.content_hash = content_hash
-            existing.model_version = model_version
-            existing.indexed_at = utc_now()
-            return existing
-
-        vec = SegmentVectorModel(
-            segment_id=segment_id,
-            embedding_model=embedding_model,
-            model_version=model_version,
-            faiss_vector_id=faiss_vector_id,
-            content_hash=content_hash,
-            indexed_at=utc_now()
-        )
-        self.session.add(vec)
-        self.session.flush()
-        return vec
-
-    def get_segment_vector_by_faiss_id(self, embedding_model: str, faiss_vector_id: int) -> Optional[SegmentVectorModel]:
-        return self.session.query(SegmentVectorModel).filter(
-            SegmentVectorModel.embedding_model == embedding_model,
-            SegmentVectorModel.faiss_vector_id == faiss_vector_id
-        ).first()
-
-    def get_next_faiss_vector_id(self, embedding_model: str) -> int:
-        max_id = self.session.query(func.max(SegmentVectorModel.faiss_vector_id)).filter(
-            SegmentVectorModel.embedding_model == embedding_model
-        ).scalar()
-        return (max_id + 1) if max_id is not None else 0
-
-    def delete_segment_vector(self, embedding_model: str, segment_id: uuid.UUID):
-        self.session.query(SegmentVectorModel).filter(
-            SegmentVectorModel.embedding_model == embedding_model,
-            SegmentVectorModel.segment_id == segment_id
-        ).delete()
-
 
 # =============================================================================
-# JSON Knowledge Base Migrator & Seeder
+# JSON Knowledge Base Migrator
 # =============================================================================
 
 class JSONKnowledgeBaseMigrator:
@@ -793,7 +849,6 @@ class JSONKnowledgeBaseMigrator:
     """
 
     def __init__(self, data_dir: Optional[Path] = None, session: Optional[Session] = None):
-        from src.rag.config import DOMAINS_DATA_DIR
         self.data_dir = data_dir or DOMAINS_DATA_DIR
         self._external_session = session
 
@@ -869,9 +924,11 @@ class JSONKnowledgeBaseMigrator:
             else:
                 stats["domains_updated"] += 1
 
+            # Ingest Domain Chunk
             all_chunks.append(build_domain_chunk(domain_data))
 
-            tables_data: List[Dict[str, Any]] = []
+            # Ingest Tables
+            tables_data = []
             if tables_file.exists():
                 try:
                     with open(tables_file, "r", encoding="utf-8") as tf:
@@ -882,13 +939,11 @@ class JSONKnowledgeBaseMigrator:
             for tdata in tables_data:
                 tname = tdata.get("table_name", "").strip().lower()
                 sql = tdata.get("sql", "").strip()
-                thash = compute_sha256(sql)
 
                 tbl_obj, t_created = repo.upsert_table(
                     domain_uuid=dom_obj.id,
                     table_name=tname,
                     sql_definition=sql,
-                    content_hash=thash,
                     description=tdata.get("description"),
                     keywords=tdata.get("keywords", [])
                 )
@@ -900,7 +955,8 @@ class JSONKnowledgeBaseMigrator:
                 table_obj_map[tname] = tbl_obj
                 all_chunks.append(build_table_chunk(domain_data, tdata))
 
-            columns_data: List[Dict[str, Any]] = []
+            # Ingest Columns & Foreign Key Dependencies
+            columns_data = []
             if columns_file.exists():
                 try:
                     with open(columns_file, "r", encoding="utf-8") as cf:
@@ -955,7 +1011,7 @@ class JSONKnowledgeBaseMigrator:
                         fk_col=col_name
                     ))
 
-        # Stage 2: Ingest Hybrid Segments
+        # Stage 2: Ingest Hybrid Segments (Key-Driven)
         logger.info(f"Processing {len(all_chunks)} hybrid knowledge segments...")
         for chunk in all_chunks:
             dom = repo.get_domain_by_business_id(chunk.domain_id, active_only=False)
@@ -975,17 +1031,17 @@ class JSONKnowledgeBaseMigrator:
                 segment_type=chunk.segment_type,
                 segment_name=chunk.segment_name,
                 content=chunk.content,
-                content_hash=chunk.content_hash,
+                segment_key=chunk.segment_key,
                 is_active=True
             )
 
             if op == "INSERT":
                 stats["segments_created"] += 1
-                repo.create_embedding_job(seg_obj.id, chunk.content_hash, "INSERT")
+                repo.create_embedding_job(seg_obj.id, operation="INSERT")
                 stats["embedding_jobs_created"] += 1
             elif op == "UPDATE":
                 stats["segments_updated"] += 1
-                repo.create_embedding_job(seg_obj.id, chunk.content_hash, "UPDATE")
+                repo.create_embedding_job(seg_obj.id, operation="UPDATE")
                 stats["embedding_jobs_created"] += 1
             else:
                 stats["segments_skipped"] += 1

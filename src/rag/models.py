@@ -19,6 +19,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declarative_base, relationship
 
+from src.config import get_logger
+
+logger = get_logger(__name__)
+
 Base = declarative_base()
 
 
@@ -54,17 +58,21 @@ class DomainModel(Base):
     segments = relationship("KnowledgeSegmentModel", back_populates="domain", cascade="all, delete-orphan")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "domain_id": self.domain_id,
-            "system_name": self.system_name,
-            "domain_name": self.domain_name,
-            "description": self.description,
-            "keywords": self.keywords or [],
-            "is_active": self.is_active,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "domain_id": self.domain_id,
+                "system_name": self.system_name,
+                "domain_name": self.domain_name,
+                "description": self.description,
+                "keywords": self.keywords or [],
+                "is_active": self.is_active,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing DomainModel to dict: {e}")
+            return {"id": str(self.id), "domain_id": getattr(self, "domain_id", "")}
 
 
 # ---------------------------------------------------------------------
@@ -79,7 +87,6 @@ class KnowledgeTableModel(Base):
     description = Column(Text, nullable=True)
     keywords = Column(JSON, default=list)
     sql_definition = Column(Text, nullable=False)
-    content_hash = Column(String(64), nullable=False, index=True)
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
@@ -106,18 +113,21 @@ class KnowledgeTableModel(Base):
     segments = relationship("KnowledgeSegmentModel", back_populates="table")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "domain_id": str(self.domain_id),
-            "table_name": self.table_name,
-            "description": self.description,
-            "keywords": self.keywords or [],
-            "sql_definition": self.sql_definition,
-            "content_hash": self.content_hash,
-            "is_active": self.is_active,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "domain_id": str(self.domain_id),
+                "table_name": self.table_name,
+                "description": self.description,
+                "keywords": self.keywords or [],
+                "sql_definition": self.sql_definition,
+                "is_active": self.is_active,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing KnowledgeTableModel to dict: {e}")
+            return {"id": str(self.id), "table_name": getattr(self, "table_name", "")}
 
 
 # ---------------------------------------------------------------------
@@ -148,21 +158,25 @@ class KnowledgeColumnModel(Base):
     table = relationship("KnowledgeTableModel", back_populates="columns")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "table_id": str(self.table_id),
-            "column_name": self.column_name,
-            "data_type": self.data_type,
-            "description": self.description,
-            "is_primary_key": self.is_primary_key,
-            "is_foreign_key": self.is_foreign_key,
-            "references_table": self.references_table,
-            "references_column": self.references_column,
-            "keywords": self.keywords or [],
-            "is_active": self.is_active,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "table_id": str(self.table_id),
+                "column_name": self.column_name,
+                "data_type": self.data_type,
+                "description": self.description,
+                "is_primary_key": self.is_primary_key,
+                "is_foreign_key": self.is_foreign_key,
+                "references_table": self.references_table,
+                "references_column": self.references_column,
+                "keywords": self.keywords or [],
+                "is_active": self.is_active,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing KnowledgeColumnModel to dict: {e}")
+            return {"id": str(self.id), "column_name": getattr(self, "column_name", "")}
 
 
 # ---------------------------------------------------------------------
@@ -186,13 +200,17 @@ class TableDependencyModel(Base):
     referenced_table = relationship("KnowledgeTableModel", foreign_keys=[referenced_table_id], back_populates="incoming_dependencies")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "source_table_id": str(self.source_table_id),
-            "referenced_table_id": str(self.referenced_table_id),
-            "relationship_type": self.relationship_type,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "source_table_id": str(self.source_table_id),
+                "referenced_table_id": str(self.referenced_table_id),
+                "relationship_type": self.relationship_type,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing TableDependencyModel to dict: {e}")
+            return {"id": str(self.id)}
 
 
 # ---------------------------------------------------------------------
@@ -208,8 +226,8 @@ class KnowledgeSegmentModel(Base):
     topic = Column(String(128), nullable=False, index=True)
     segment_type = Column(String(64), nullable=False, index=True)
     segment_name = Column(String(256), nullable=False)
+    segment_key = Column(String(256), nullable=True, index=True)  # Business key: domain_id:table_id:segment_name
     content = Column(Text, nullable=False)
-    content_hash = Column(String(64), nullable=False, index=True)
     version = Column(Integer, nullable=False, default=1)
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -223,21 +241,25 @@ class KnowledgeSegmentModel(Base):
     vectors = relationship("SegmentVectorModel", back_populates="segment", cascade="all, delete-orphan")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "domain_id": str(self.domain_id),
-            "table_id": str(self.table_id) if self.table_id else None,
-            "section": self.section,
-            "topic": self.topic,
-            "segment_type": self.segment_type,
-            "segment_name": self.segment_name,
-            "content": self.content,
-            "content_hash": self.content_hash,
-            "version": self.version,
-            "is_active": self.is_active,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "domain_id": str(self.domain_id),
+                "table_id": str(self.table_id) if self.table_id else None,
+                "section": self.section,
+                "topic": self.topic,
+                "segment_type": self.segment_type,
+                "segment_name": self.segment_name,
+                "segment_key": self.segment_key,
+                "content": self.content,
+                "version": self.version,
+                "is_active": self.is_active,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing KnowledgeSegmentModel to dict: {e}")
+            return {"id": str(self.id), "segment_name": getattr(self, "segment_name", "")}
 
 
 # ---------------------------------------------------------------------
@@ -250,7 +272,6 @@ class SegmentVersionModel(Base):
     segment_id = Column(UUIDType, ForeignKey("knowledge_segments.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
-    content_hash = Column(String(64), nullable=False)
     changed_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     __table_args__ = (
@@ -261,14 +282,17 @@ class SegmentVersionModel(Base):
     segment = relationship("KnowledgeSegmentModel", back_populates="versions")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "segment_id": str(self.segment_id),
-            "version": self.version,
-            "content": self.content,
-            "content_hash": self.content_hash,
-            "changed_at": self.changed_at.isoformat() if self.changed_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "segment_id": str(self.segment_id),
+                "version": self.version,
+                "content": self.content,
+                "changed_at": self.changed_at.isoformat() if self.changed_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing SegmentVersionModel to dict: {e}")
+            return {"id": str(self.id), "version": getattr(self, "version", 1)}
 
 
 # ---------------------------------------------------------------------
@@ -279,7 +303,6 @@ class EmbeddingJobModel(Base):
 
     id = Column(UUIDType, primary_key=True, default=generate_uuid)
     segment_id = Column(UUIDType, ForeignKey("knowledge_segments.id", ondelete="CASCADE"), nullable=False, index=True)
-    content_hash = Column(String(64), nullable=False)
     operation = Column(String(32), nullable=False)  # INSERT, UPDATE, DELETE
     status = Column(String(32), nullable=False, default="PENDING", index=True)  # PENDING, PROCESSING, COMPLETED, FAILED
     retry_count = Column(Integer, nullable=False, default=0)
@@ -291,17 +314,20 @@ class EmbeddingJobModel(Base):
     segment = relationship("KnowledgeSegmentModel", back_populates="embedding_jobs")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "segment_id": str(self.segment_id),
-            "content_hash": self.content_hash,
-            "operation": self.operation,
-            "status": self.status,
-            "retry_count": self.retry_count,
-            "error_message": self.error_message,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "segment_id": str(self.segment_id),
+                "operation": self.operation,
+                "status": self.status,
+                "retry_count": self.retry_count,
+                "error_message": self.error_message,
+                "created_at": self.created_at.isoformat() if self.created_at else None,
+                "processed_at": self.processed_at.isoformat() if self.processed_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing EmbeddingJobModel to dict: {e}")
+            return {"id": str(self.id), "operation": getattr(self, "operation", "")}
 
 
 # ---------------------------------------------------------------------
@@ -315,7 +341,6 @@ class SegmentVectorModel(Base):
     embedding_model = Column(String(128), nullable=False)
     model_version = Column(String(64), nullable=False, default="v1")
     faiss_vector_id = Column(BigInteger, nullable=False, index=True)
-    content_hash = Column(String(64), nullable=False)
     indexed_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     __table_args__ = (
@@ -327,12 +352,15 @@ class SegmentVectorModel(Base):
     segment = relationship("KnowledgeSegmentModel", back_populates="vectors")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "segment_id": str(self.segment_id),
-            "embedding_model": self.embedding_model,
-            "model_version": self.model_version,
-            "faiss_vector_id": self.faiss_vector_id,
-            "content_hash": self.content_hash,
-            "indexed_at": self.indexed_at.isoformat() if self.indexed_at else None,
-        }
+        try:
+            return {
+                "id": str(self.id),
+                "segment_id": str(self.segment_id),
+                "embedding_model": self.embedding_model,
+                "model_version": self.model_version,
+                "faiss_vector_id": self.faiss_vector_id,
+                "indexed_at": self.indexed_at.isoformat() if self.indexed_at else None,
+            }
+        except Exception as e:
+            logger.error(f"Error serializing SegmentVectorModel to dict: {e}")
+            return {"id": str(self.id), "embedding_model": getattr(self, "embedding_model", "")}

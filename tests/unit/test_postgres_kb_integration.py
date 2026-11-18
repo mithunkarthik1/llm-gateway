@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import unittest
@@ -11,7 +10,6 @@ from src.rag.database import (
     init_db,
     KnowledgeBaseRepository,
     JSONKnowledgeBaseMigrator,
-    compute_sha256,
     generate_stable_segment_uuid,
     build_domain_chunk,
     build_table_chunk,
@@ -105,7 +103,6 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
 
             test_uuid = generate_stable_segment_uuid("erp_finance", "Test Topic", "test_segment")
             initial_content = "Initial test content for version tracking"
-            initial_hash = compute_sha256(initial_content)
 
             # 1. Create version 1
             seg1, op1 = repo.upsert_segment(
@@ -116,8 +113,7 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
                 topic="Test Topic",
                 segment_type="table",
                 segment_name="test_segment",
-                content=initial_content,
-                content_hash=initial_hash
+                content=initial_content
             )
             self.assertEqual(op1, "INSERT")
             self.assertEqual(seg1.version, 1)
@@ -125,7 +121,6 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
 
             # 2. Update with modified content
             modified_content = "Modified test content with extra financial notes"
-            modified_hash = compute_sha256(modified_content)
             seg2, op2 = repo.upsert_segment(
                 segment_uuid=test_uuid,
                 domain_id=dom.id,
@@ -134,8 +129,7 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
                 topic="Test Topic",
                 segment_type="table",
                 segment_name="test_segment",
-                content=modified_content,
-                content_hash=modified_hash
+                content=modified_content
             )
             self.assertEqual(op2, "UPDATE")
             self.assertEqual(seg2.id, test_uuid)  # UUID strictly preserved!
@@ -165,7 +159,6 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
                 segment_type="table",
                 segment_name="inactive_seg",
                 content="Inactive confidential segment",
-                content_hash=compute_sha256("Inactive confidential segment"),
                 is_active=False
             )
             active_segs = repo.list_active_segments(domain_id=dom.id)

@@ -7,11 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN pip install --no-cache-dir poetry
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md alembic.ini* ./
 RUN poetry install --no-root --no-interaction
 
 COPY src/ ./src/
 COPY utils/ ./utils/
+COPY migrations/ ./migrations/
 
 EXPOSE 8000
 CMD ["python", "-m", "src.main"]

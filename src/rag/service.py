@@ -1937,6 +1937,53 @@ class ERPEnterpriseRAGService:
                 "token_used": 0
             }
 
+    def alter_segment(
+        self,
+        new_content: str,
+        segment_id: Optional[str] = None,
+        segment_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        2-Tier Schema Segment Alteration:
+        - Tier 1: Point alteration by permanent segment_id (UUID).
+        - Tier 2: Logical lookup by business segment_key (e.g. domain:table:column).
+        Removes reliance on content hashing for finding or modifying segments.
+        """
+        import uuid
+        from src.rag.database import get_db, KnowledgeBaseRepository
+
+        with get_db() as session:
+            repo = KnowledgeBaseRepository(session)
+            target_id = None
+            if segment_id:
+                target_id = uuid.UUID(str(segment_id))
+            elif segment_key:
+                seg = repo.get_segment_by_key(segment_key, active_only=False)
+                if seg:
+                    target_id = seg.id
+
+            if not target_id:
+                raise ValueError(f"Could not locate segment with segment_id='{segment_id}' or segment_key='{segment_key}'")
+
+            seg_obj, op = repo.alter_segment(
+                segment_id=target_id,
+                new_content=new_content,
+                new_segment_key=segment_key
+            )
+            session.commit()
+
+            # Process ChromaDB sync immediately
+            synchronizer = ChromaPostgresSynchronizer()
+            sync_stats = synchronizer.process_pending_jobs(batch_size=10, session=session)
+
+            return {
+                "segment_id": str(seg_obj.id),
+                "segment_key": seg_obj.segment_key,
+                "version": seg_obj.version,
+                "operation": op,
+                "sync_stats": sync_stats
+            }
+
 
 # =====================================================================
 # Global Service Singleton & Helper Functions
@@ -2079,12 +2126,16 @@ class ChromaSchemaEngine:
         else:
             emb_list = embedding
 
-        self.collection.upsert(
-            ids=[str(segment_id)],
-            documents=[document],
-            metadatas=[clean_meta],
-            embeddings=[emb_list]
-        )
+        try:
+            self.collection.upsert(
+                ids=[str(segment_id)],
+                documents=[document],
+                metadatas=[clean_meta],
+                embeddings=[emb_list]
+            )
+        except Exception as e:
+            logger.error(f"Failed to upsert segment '{segment_id}' in ChromaDB: {e}", exc_info=True)
+            raise
 
     def upsert_batch(
         self,
@@ -2118,12 +2169,16 @@ class ChromaSchemaEngine:
         else:
             emb_list = embeddings
 
-        self.collection.upsert(
-            ids=[str(i) for i in ids],
-            documents=documents,
-            metadatas=clean_metadatas,
-            embeddings=emb_list
-        )
+        try:
+            self.collection.upsert(
+                ids=[str(i) for i in ids],
+                documents=documents,
+                metadatas=clean_metadatas,
+                embeddings=emb_list
+            )
+        except Exception as e:
+            logger.error(f"Failed to upsert batch of {len(ids)} segments in ChromaDB: {e}", exc_info=True)
+            raise
 
     def delete_segment(self, segment_id: str):
         """Deletes a segment by ID from ChromaDB."""
@@ -2145,6 +2200,23 @@ class ChromaSchemaEngine:
                 }
         except Exception as e:
             logger.warning(f"Error fetching segment '{segment_id}' from ChromaDB: {e}")
+        return None
+
+    def get_segment_by_key(self, segment_key: str) -> Optional[Dict[str, Any]]:
+        """Tier 2: Direct lookup in ChromaDB by business segment_key."""
+        try:
+            res = self.collection.get(
+                where={"segment_key": str(segment_key)},
+                include=["documents", "metadatas"]
+            )
+            if res and res.get("ids") and len(res["ids"]) > 0:
+                return {
+                    "id": res["ids"][0],
+                    "document": res["documents"][0] if res.get("documents") else "",
+                    "metadata": res["metadatas"][0] if res.get("metadatas") else {}
+                }
+        except Exception as e:
+            logger.warning(f"Error fetching segment by key '{segment_key}' from ChromaDB: {e}")
         return None
 
     def search(
@@ -2285,7 +2357,7 @@ class ChromaPostgresSynchronizer:
                             if "." in seg.segment_name and seg.segment_type in ("table", "column", "relationship")
                             else ""
                         )
-                        ident_key = f"{d_code or str(seg.domain_id)}:{t_name or 'none'}:{seg.segment_name}"
+                        ident_key = getattr(seg, "segment_key", None) or f"{d_code or str(seg.domain_id)}:{t_name or 'none'}:{seg.segment_name}"
 
                         meta = {
                             "domain_id": str(seg.domain_id),
@@ -2297,6 +2369,7 @@ class ChromaPostgresSynchronizer:
                             "segment_type": seg.segment_type,
                             "segment_name": seg.segment_name,
                             "version": seg.version,
+                            "segment_key": ident_key,
                             "identity_key": ident_key,
                         }
 
@@ -2339,6 +2412,223 @@ class ChromaPostgresSynchronizer:
                 total_stats[k] += cur.get(k, 0)
         logger.info(f"All pending ChromaDB embedding jobs synchronized: {total_stats}")
         return total_stats
+
+    def sync_segment(
+        self,
+        segment_id: Optional[str] = None,
+        segment_key: Optional[str] = None,
+        session: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        Synchronizes ONLY a single specific segment from PostgreSQL into ChromaDB.
+        Logs every stage: chunk extraction, embedding computation, and vector storage.
+        """
+        import uuid
+        import numpy as np
+        from src.rag.database import get_db, KnowledgeBaseRepository
+        from src.rag.models import KnowledgeSegmentModel, DomainModel, KnowledgeTableModel
+
+        def _run(sess):
+            repo = KnowledgeBaseRepository(sess)
+            seg = None
+            if segment_id:
+                seg = repo.get_segment_by_id(uuid.UUID(str(segment_id)))
+            elif segment_key:
+                seg = repo.get_segment_by_key(segment_key, active_only=False)
+
+            if not seg:
+                err = f"Segment not found: id='{segment_id}' key='{segment_key}'"
+                logger.error(f"[CHUNK PROCESS FAILED] {err}")
+                raise ValueError(err)
+
+            # Stage 1: Chunk Inspection & Process
+            logger.info("=" * 70)
+            logger.info("[STAGE 1: CHUNK PROCESS]")
+            logger.info(f"  - Target Segment ID   : {seg.id}")
+            logger.info(f"  - Business Key        : {seg.segment_key}")
+            logger.info(f"  - Segment Name        : {seg.segment_name}")
+            logger.info(f"  - Segment Type        : {seg.segment_type}")
+            logger.info(f"  - Version             : {seg.version}")
+            logger.info(f"  - Content Length      : {len(seg.content)} characters")
+            first_line = seg.content.strip().splitlines()[0] if seg.content.strip() else ""
+            logger.info(f"  - Content Header      : {first_line}")
+            logger.info("=" * 70)
+
+            # Stage 2: Embedding Generation
+            logger.info("[STAGE 2: EMBEDDING INFERENCE]")
+            logger.info(f"  - Embedding Model     : {self.model_name}")
+            model = get_embedding_model()
+            emb = model.encode(seg.content, convert_to_numpy=True, normalize_embeddings=True)
+            emb_vector = emb.astype(np.float32)
+            logger.info(f"  - Generated Vector    : Dimension={len(emb_vector)} | Norm={float(np.linalg.norm(emb_vector)):.4f}")
+            logger.info("=" * 70)
+
+            # Stage 3: Vector Storing
+            count_before = self.chroma_engine.count()
+            logger.info("[STAGE 3: VECTOR STORING]")
+            logger.info(f"  - Target Collection   : {self.chroma_engine.collection_name}")
+            logger.info(f"  - Vector Count Before : {count_before}")
+
+            dom_map = {d.id: d.domain_id for d in repo.session.query(DomainModel).all()}
+            table_map = {t.id: t.table_name for t in repo.session.query(KnowledgeTableModel).all()}
+            d_code = dom_map.get(seg.domain_id, "")
+            t_name = table_map.get(seg.table_id, "") if seg.table_id else (
+                seg.segment_name.split(".")[0]
+                if "." in seg.segment_name and seg.segment_type in ("table", "column", "relationship")
+                else ""
+            )
+            ident_key = seg.segment_key or f"{d_code or str(seg.domain_id)}:{t_name or 'none'}:{seg.segment_name}"
+
+            meta = {
+                "domain_id": str(seg.domain_id),
+                "domain_code": d_code,
+                "domain_name": seg.section,
+                "table_id": str(seg.table_id) if seg.table_id else "",
+                "table_name": t_name,
+                "topic": seg.topic,
+                "segment_type": seg.segment_type,
+                "segment_name": seg.segment_name,
+                "version": seg.version,
+                "segment_key": ident_key,
+                "identity_key": ident_key,
+            }
+
+            self.chroma_engine.upsert_segment(
+                segment_id=str(seg.id),
+                document=seg.content,
+                metadata=meta,
+                embedding=emb_vector
+            )
+            count_after = self.chroma_engine.count()
+            logger.info(f"  - Vector Count After  : {count_after}")
+            logger.info(f"  - Net Vector Delta    : +{count_after - count_before} (In-place overwrite, 0 duplicate vectors)")
+            logger.info("=" * 70)
+
+            return {
+                "segment_id": str(seg.id),
+                "segment_key": seg.segment_key,
+                "version": seg.version,
+                "content_length": len(seg.content),
+                "embedding_dimension": len(emb_vector),
+                "count_before": count_before,
+                "count_after": count_after,
+                "status": "SUCCESS"
+            }
+
+        if session:
+            return _run(session)
+        else:
+            from src.rag.database import get_db
+            with get_db() as sess:
+                return _run(sess)
+
+    def auto_sync_changes(self, session: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        2-Tier Automated Change-Detection Synchronizer:
+        Scans all PostgreSQL active segments against ChromaDB vectors without needing
+        the user to specify which segment or key changed.
+        Identifies only modified, new, or stale segments and synchronizes them.
+        """
+        import uuid
+        from src.rag.database import get_db, KnowledgeBaseRepository
+
+        def _run(sess):
+            repo = KnowledgeBaseRepository(sess)
+            logger.info("=" * 70)
+            logger.info("[AUTO-SYNC: 2-TIER CHANGE DETECTION SCAN]")
+            logger.info("Scanning PostgreSQL primary knowledge base against ChromaDB...")
+
+            # 1. Fetch live PostgreSQL active segments
+            pg_segments = repo.list_active_segments()
+            pg_count = len(pg_segments)
+            pg_map = {str(s.id): s for s in pg_segments}
+
+            # 2. Fetch ChromaDB collection state
+            chroma_data = self.chroma_engine.collection.get(include=["documents", "metadatas"])
+            chroma_count = len(chroma_data["ids"]) if chroma_data and chroma_data.get("ids") else 0
+            chroma_map = {}
+            if chroma_data and chroma_data.get("ids"):
+                for cid, cdoc, cmeta in zip(chroma_data["ids"], chroma_data["documents"], chroma_data["metadatas"]):
+                    chroma_map[cid] = (cdoc or "", cmeta or {})
+
+            logger.info(f"  - PostgreSQL Active Segments : {pg_count}")
+            logger.info(f"  - ChromaDB Indexed Vectors   : {chroma_count}")
+
+            # 3. Detect modified, new, or stale segments
+            modified_segments = []
+            new_segments = []
+            deleted_ids = []
+
+            for sid, seg in pg_map.items():
+                if sid not in chroma_map:
+                    new_segments.append(seg)
+                else:
+                    cdoc, cmeta = chroma_map[sid]
+                    # Direct content equality check without hashing
+                    content_changed = (seg.content.strip() != cdoc.strip())
+                    key_changed = (seg.segment_key is not None and seg.segment_key != cmeta.get("segment_key"))
+                    version_changed = (seg.version != cmeta.get("version"))
+
+                    if content_changed or key_changed or version_changed:
+                        modified_segments.append(seg)
+
+            for cid in chroma_map:
+                if cid not in pg_map:
+                    deleted_ids.append(cid)
+
+            total_changes = len(modified_segments) + len(new_segments) + len(deleted_ids)
+            logger.info(f"  - Total Changes Detected     : {total_changes}")
+            logger.info(f"    * Modified Segments        : {len(modified_segments)}")
+            logger.info(f"    * New Segments             : {len(new_segments)}")
+            logger.info(f"    * Deleted/Stale Segments   : {len(deleted_ids)}")
+            logger.info("=" * 70)
+
+            if total_changes == 0:
+                logger.info("[AUTO-SYNC COMPLETED] ChromaDB is 100% up to date with PostgreSQL. Zero re-indexing needed.")
+                return {
+                    "total_changes": 0,
+                    "modified": 0,
+                    "new": 0,
+                    "deleted": 0,
+                    "chroma_count": chroma_count,
+                    "status": "UP_TO_DATE"
+                }
+
+            # 4. Process deletions
+            for del_id in deleted_ids:
+                logger.info(f"[DELETE STALE VECTOR] Removing segment ID '{del_id}' from ChromaDB...")
+                self.chroma_engine.delete_segment(del_id)
+
+            # 5. Process new & modified segments with full 3-stage logging
+            reindexed = []
+            for seg in modified_segments:
+                logger.info(f"[CHANGE DETECTED] Triggering re-index for modified segment '{seg.segment_key}' (ID: {seg.id})...")
+                res = self.sync_segment(segment_id=str(seg.id), session=sess)
+                reindexed.append(res)
+
+            for seg in new_segments:
+                logger.info(f"[NEW SEGMENT DETECTED] Triggering index for new segment '{seg.segment_key}' (ID: {seg.id})...")
+                res = self.sync_segment(segment_id=str(seg.id), session=sess)
+                reindexed.append(res)
+
+            final_count = self.chroma_engine.count()
+            logger.info(f"[AUTO-SYNC FINISHED] Successfully processed {len(reindexed)} segment(s). ChromaDB final vector count: {final_count}")
+
+            return {
+                "total_changes": total_changes,
+                "modified": len(modified_segments),
+                "new": len(new_segments),
+                "deleted": len(deleted_ids),
+                "reindexed_segments": [r["segment_key"] for r in reindexed],
+                "final_count": final_count,
+                "status": "SYNCHRONIZED"
+            }
+
+        if session:
+            return _run(session)
+        else:
+            with get_db() as sess:
+                return _run(sess)
 
     def search_active_segments(
         self,
@@ -2383,7 +2673,6 @@ class ChromaPostgresSynchronizer:
                     "segment_type": seg.segment_type,
                     "segment_name": seg.segment_name,
                     "content": seg.content,
-                    "content_hash": seg.content_hash,
                     "version": seg.version,
                     "score": float(cr.get("similarity", 0.0)),
                     "identity_key": cr.get("metadata", {}).get("identity_key", ""),
@@ -2445,6 +2734,15 @@ def sync_chroma_from_postgres(batch_size: int = 128) -> int:
         return total
 
 
+def auto_sync_chroma() -> Dict[str, Any]:
+    """
+    Zero-argument change-detection synchronizer:
+    Automatically identifies any altered, added, or deleted segments in PostgreSQL
+    and synchronizes ChromaDB.
+    """
+    return get_embedding_synchronizer().auto_sync_changes()
+
+
 _SYNC_INSTANCE: Optional[ChromaPostgresSynchronizer] = None
 
 
@@ -2457,7 +2755,6 @@ def get_embedding_synchronizer() -> ChromaPostgresSynchronizer:
 
 # Re-export chunking helpers from src.rag.database for convenience
 from src.rag.database import (
-    compute_sha256,
     generate_stable_segment_uuid,
     KnowledgeChunk,
     build_domain_chunk,
