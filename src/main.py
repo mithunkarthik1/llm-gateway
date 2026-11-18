@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import get_logger
 from src.generator.api import router as generator_router
 from src.gateway.api import router as gateway_router
+from src.rag.api import router as kb_router
 
 logger = get_logger(__name__)
 
@@ -43,3 +44,4 @@ def health_check():
 
 app.include_router(generator_router)
 app.include_router(gateway_router)
+app.include_router(kb_router)

@@ -8,4 +8,9 @@ onnxruntime
 pandas
 sqlglot
 openpyxl
+chromadb
+psycopg2-binary
+sqlalchemy
+sentence-transformers
+faiss-cpu
 

@@ -38,3 +38,5 @@ Thumbs.db
 tests/reports/
 *.log
 
+#knowledge base 
+src/rag/data/domains/*

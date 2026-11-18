@@ -20,6 +20,8 @@ if env_file.exists():
         pass
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+GROQ_MODELS_URL = os.getenv("GROQ_MODELS_URL", "https://api.groq.com/openai/v1/models")
 
 def normalize_groq_model(model_name: str) -> str:
     m = (model_name or "").strip()

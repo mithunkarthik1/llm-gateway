@@ -4,11 +4,15 @@ import logging
 from typing import Any, Dict, Optional
 import requests
 
-from src.config import get_logger, GROQ_API_KEY, DEFAULT_GROQ_MODEL, normalize_groq_model
+from src.config import (
+    get_logger,
+    GROQ_API_KEY,
+    DEFAULT_GROQ_MODEL,
+    normalize_groq_model,
+    GROQ_API_URL,
+)
 
 logger = get_logger(__name__)
-
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GATEWAY_SYSTEM_PROMPT = """Route db request:
 - suggested_model: "create-nexus-slm" (greetings, 1-5 tables schema) or "groq" (questions, 6+ tables).

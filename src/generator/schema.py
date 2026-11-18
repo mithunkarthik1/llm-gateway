@@ -10,7 +10,7 @@ class GenerateRequest(BaseModel):
     max_token: Optional[int] = Field(None, description="Alternative field for max_tokens")
 
     model: Optional[str] = Field(
-        default="qwen2.5-coder-0.5b-tied-embed-q4",
+        default="llama-3.3-70b-versatile",
         description="Model name"
     )
 
@@ -100,10 +100,13 @@ class GenerateData(BaseModel):
     sql: str = Field(default="", description="Generated MySQL 8.0 CREATE TABLE statements")
     updated_summary: str = Field(default="", description="Updated schema ledger summary")
     explanation: str = Field(default="", description="Step-by-step schema explanation")
-    warnings: list[str] = Field(default_factory=list, description="Validation or relationship warnings")
-    needs_clarification: bool = Field(default=False, description="Whether clarification is required")
 
     # Fields hidden/excluded from client response JSON (retained internally in Python code):
+    debug: dict = Field(default_factory=dict, exclude=True, description="Debugging trace and structured query plan")
+    columns_metadata: list[dict] = Field(default_factory=list, exclude=True, description="Granular structured per-column metadata")
+    warnings: list[str] = Field(default_factory=list, exclude=True, description="Validation or relationship warnings")
+    needs_clarification: bool = Field(default=False, exclude=True, description="Whether clarification is required")
+    suggestions: list[str] = Field(default_factory=list, exclude=True, description="Suggestions for ambiguous entities")
     sql_query: Optional[str] = Field(default="", exclude=True, description="Internal alias for sql")
     dbml: Optional[str] = Field(default="", exclude=True, description="Internal DBML schema representation")
     schema_plan: list[dict] = Field(default_factory=list, exclude=True, description="Structured column definitions and relationships array (hidden to prevent response bloat)")
@@ -116,7 +119,7 @@ class GenerateData(BaseModel):
 class StandardGenerateResponse(BaseModel):
     message: str = Field(default="Query processed successfully")
     status_code: int = Field(default=200)
-    status: Optional[str] = Field(default="accepted", description="Status string: accepted, rejected, clarification_required")
+    status: Optional[str] = Field(default="accepted", exclude=True, description="Status string: accepted, rejected, clarification_required")
     data: GenerateData
 
 
