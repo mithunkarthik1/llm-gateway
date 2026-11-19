@@ -8,8 +8,7 @@ Usage:
     poetry run python utils/sync_chroma.py
 """
 import sys
-from src.rag.service import auto_sync_chroma
+from src.rag.sync import run_sync
 
 if __name__ == "__main__":
-    result = auto_sync_chroma()
-    sys.exit(0)
+    sys.exit(run_sync())

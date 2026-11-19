@@ -45,6 +45,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
+    logger.propagate = False
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         handler = logging.StreamHandler()

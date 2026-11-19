@@ -25,6 +25,8 @@ tests/
 *benchmark_results.json
 *.tmp
 *.log
+scratch/
+
 
 # Docker metadata
 Dockerfile

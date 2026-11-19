@@ -2421,9 +2421,10 @@ class ChromaPostgresSynchronizer:
     ) -> Dict[str, Any]:
         """
         Synchronizes ONLY a single specific segment from PostgreSQL into ChromaDB.
-        Logs every stage: chunk extraction, embedding computation, and vector storage.
+        Logs every stage with high clarity: chunk extraction, embedding computation, and vector storage.
         """
         import uuid
+        import time
         import numpy as np
         from src.rag.database import get_db, KnowledgeBaseRepository
         from src.rag.models import KnowledgeSegmentModel, DomainModel, KnowledgeTableModel
@@ -2441,33 +2442,41 @@ class ChromaPostgresSynchronizer:
                 logger.error(f"[CHUNK PROCESS FAILED] {err}")
                 raise ValueError(err)
 
-            # Stage 1: Chunk Inspection & Process
-            logger.info("=" * 70)
-            logger.info("[STAGE 1: CHUNK PROCESS]")
-            logger.info(f"  - Target Segment ID   : {seg.id}")
-            logger.info(f"  - Business Key        : {seg.segment_key}")
-            logger.info(f"  - Segment Name        : {seg.segment_name}")
-            logger.info(f"  - Segment Type        : {seg.segment_type}")
-            logger.info(f"  - Version             : {seg.version}")
-            logger.info(f"  - Content Length      : {len(seg.content)} characters")
-            first_line = seg.content.strip().splitlines()[0] if seg.content.strip() else ""
-            logger.info(f"  - Content Header      : {first_line}")
-            logger.info("=" * 70)
+            # Stage 1: Chunk Inspection & Validation
+            logger.info("  " + "─" * 70)
+            logger.info("  [STAGE 1/3: CHUNK EXTRACTION & VALIDATION]")
+            logger.info(f"    • Segment Key       : {seg.segment_key}")
+            logger.info(f"    • PostgreSQL UUID   : {seg.id}")
+            logger.info(f"    • Domain & Section  : {seg.section}")
+            logger.info(f"    • Topic / Entity    : {seg.topic}")
+            logger.info(f"    • Segment Type      : {seg.segment_type} (Name: {seg.segment_name})")
+            logger.info(f"    • Schema Version    : v{seg.version}")
+            logger.info(f"    • Content Length    : {len(seg.content)} characters ({len(seg.content.splitlines())} lines)")
+            content_lines = [l.strip() for l in seg.content.splitlines() if l.strip()]
+            preview_snippet = " | ".join(content_lines[:3]) if content_lines else ""
+            if len(preview_snippet) > 100:
+                preview_snippet = preview_snippet[:97] + "..."
+            logger.info(f"    • Content Preview   : {preview_snippet}")
 
             # Stage 2: Embedding Generation
-            logger.info("[STAGE 2: EMBEDDING INFERENCE]")
-            logger.info(f"  - Embedding Model     : {self.model_name}")
+            logger.info("  [STAGE 2/3: EMBEDDING INFERENCE]")
+            logger.info(f"    • Embedding Model   : {self.model_name}")
+            t_infer = time.perf_counter()
             model = get_embedding_model()
             emb = model.encode(seg.content, convert_to_numpy=True, normalize_embeddings=True)
             emb_vector = emb.astype(np.float32)
-            logger.info(f"  - Generated Vector    : Dimension={len(emb_vector)} | Norm={float(np.linalg.norm(emb_vector)):.4f}")
-            logger.info("=" * 70)
+            infer_ms = (time.perf_counter() - t_infer) * 1000.0
+            norm = float(np.linalg.norm(emb_vector))
+            logger.info(f"    • Vector Dimension  : {len(emb_vector)} floats (Dense Float32)")
+            logger.info(f"    • Normalization     : L2 Norm = {norm:.4f} (Cosine Similarity Space)")
+            logger.info(f"    • Inference Latency : {infer_ms:.2f} ms")
 
             # Stage 3: Vector Storing
             count_before = self.chroma_engine.count()
-            logger.info("[STAGE 3: VECTOR STORING]")
-            logger.info(f"  - Target Collection   : {self.chroma_engine.collection_name}")
-            logger.info(f"  - Vector Count Before : {count_before}")
+            logger.info("  [STAGE 3/3: CHROMADB VECTOR STORAGE]")
+            logger.info(f"    • Target Collection : {self.chroma_engine.collection_name}")
+            logger.info(f"    • Upsert Strategy   : In-place overwrite by stable UUID ({seg.id})")
+            logger.info(f"    • Count Before      : {count_before}")
 
             dom_map = {d.id: d.domain_id for d in repo.session.query(DomainModel).all()}
             table_map = {t.id: t.table_name for t in repo.session.query(KnowledgeTableModel).all()}
@@ -2500,9 +2509,11 @@ class ChromaPostgresSynchronizer:
                 embedding=emb_vector
             )
             count_after = self.chroma_engine.count()
-            logger.info(f"  - Vector Count After  : {count_after}")
-            logger.info(f"  - Net Vector Delta    : +{count_after - count_before} (In-place overwrite, 0 duplicate vectors)")
-            logger.info("=" * 70)
+            delta = count_after - count_before
+            logger.info(f"    • Count After       : {count_after}")
+            logger.info(f"    • Net Vector Delta  : {delta:+d} (0 duplicate vectors, clean replacement)")
+            logger.info(f"    • Status            : SUCCESS (Vector persisted to disk)")
+            logger.info("  " + "─" * 70)
 
             return {
                 "segment_id": str(seg.id),
@@ -2512,6 +2523,7 @@ class ChromaPostgresSynchronizer:
                 "embedding_dimension": len(emb_vector),
                 "count_before": count_before,
                 "count_after": count_after,
+                "inference_ms": round(infer_ms, 2),
                 "status": "SUCCESS"
             }
 
@@ -2530,20 +2542,38 @@ class ChromaPostgresSynchronizer:
         Identifies only modified, new, or stale segments and synchronizes them.
         """
         import uuid
+        import time
         from src.rag.database import get_db, KnowledgeBaseRepository
 
         def _run(sess):
+            t_start = time.perf_counter()
             repo = KnowledgeBaseRepository(sess)
-            logger.info("=" * 70)
-            logger.info("[AUTO-SYNC: 2-TIER CHANGE DETECTION SCAN]")
-            logger.info("Scanning PostgreSQL primary knowledge base against ChromaDB...")
+            logger.info("=" * 76)
+            logger.info("  CHROMA-POSTGRES 2-TIER KNOWLEDGE SYNCHRONIZER")
+            logger.info("=" * 76)
 
-            # 1. Fetch live PostgreSQL active segments
+            # Extract connection details
+            db_bind = repo.session.get_bind()
+            db_name = db_bind.url.database if db_bind and hasattr(db_bind, "url") else "db_nexus_rag"
+            db_host = f"{db_bind.url.host}:{db_bind.url.port}" if db_bind and hasattr(db_bind, "url") else "localhost:5432"
+
+            chroma_dir = getattr(self.chroma_engine, "data_dir", CHROMA_DATA_DIR)
+            logger.info("SYSTEM CONFIGURATION:")
+            logger.info(f"  • PostgreSQL DB     : {db_name} (Host: {db_host})")
+            logger.info(f"  • ChromaDB Path     : {chroma_dir}")
+            logger.info(f"  • Target Collection : {self.chroma_engine.collection_name}")
+            logger.info(f"  • Embedding Model   : {self.model_name}")
+            logger.info(f"  • Architecture      : 2-Tier (Tier 1: Business segment_key | Tier 2: UUID segment_id)")
+            logger.info(f"  • Strategy          : Zero-hash direct content & version verification")
+            logger.info("─" * 76)
+
+            logger.info("[PHASE 1: 2-TIER KNOWLEDGE SCAN & CHANGE DETECTION]")
+            logger.info("  • Fetching live active segments from PostgreSQL...")
             pg_segments = repo.list_active_segments()
             pg_count = len(pg_segments)
             pg_map = {str(s.id): s for s in pg_segments}
 
-            # 2. Fetch ChromaDB collection state
+            logger.info(f"  • Fetching existing vector records from ChromaDB collection '{self.chroma_engine.collection_name}'...")
             chroma_data = self.chroma_engine.collection.get(include=["documents", "metadatas"])
             chroma_count = len(chroma_data["ids"]) if chroma_data and chroma_data.get("ids") else 0
             chroma_map = {}
@@ -2554,7 +2584,7 @@ class ChromaPostgresSynchronizer:
             logger.info(f"  - PostgreSQL Active Segments : {pg_count}")
             logger.info(f"  - ChromaDB Indexed Vectors   : {chroma_count}")
 
-            # 3. Detect modified, new, or stale segments
+            # 3. Detect modified, new, or stale segments with detailed reasons
             modified_segments = []
             new_segments = []
             deleted_ids = []
@@ -2564,55 +2594,108 @@ class ChromaPostgresSynchronizer:
                     new_segments.append(seg)
                 else:
                     cdoc, cmeta = chroma_map[sid]
-                    # Direct content equality check without hashing
                     content_changed = (seg.content.strip() != cdoc.strip())
                     key_changed = (seg.segment_key is not None and seg.segment_key != cmeta.get("segment_key"))
                     version_changed = (seg.version != cmeta.get("version"))
 
                     if content_changed or key_changed or version_changed:
-                        modified_segments.append(seg)
+                        reasons = []
+                        if content_changed:
+                            reasons.append("Content altered in PostgreSQL")
+                        if key_changed:
+                            reasons.append(f"Segment key changed: '{cmeta.get('segment_key')}' -> '{seg.segment_key}'")
+                        if version_changed:
+                            reasons.append(f"Version bumped: v{cmeta.get('version')} -> v{seg.version}")
+                        modified_segments.append((seg, ", ".join(reasons)))
 
             for cid in chroma_map:
                 if cid not in pg_map:
                     deleted_ids.append(cid)
 
             total_changes = len(modified_segments) + len(new_segments) + len(deleted_ids)
+            logger.info("─" * 76)
+            logger.info(f"[PHASE 2: AUDIT & CHANGE EVALUATION]")
             logger.info(f"  - Total Changes Detected     : {total_changes}")
             logger.info(f"    * Modified Segments        : {len(modified_segments)}")
             logger.info(f"    * New Segments             : {len(new_segments)}")
             logger.info(f"    * Deleted/Stale Segments   : {len(deleted_ids)}")
-            logger.info("=" * 70)
 
             if total_changes == 0:
-                logger.info("[AUTO-SYNC COMPLETED] ChromaDB is 100% up to date with PostgreSQL. Zero re-indexing needed.")
+                elapsed = time.perf_counter() - t_start
+                logger.info("─" * 76)
+                logger.info("[STATUS: 100% UP-TO-DATE]")
+                logger.info(f"  ✓ All {pg_count} PostgreSQL segments are completely in sync with ChromaDB.")
+                logger.info("  ✓ Zero segments require re-indexing. No unnecessary GPU/CPU compute consumed.")
+                logger.info(f"  • Scan Duration              : {elapsed:.3f}s")
+                logger.info("=" * 76)
                 return {
                     "total_changes": 0,
                     "modified": 0,
                     "new": 0,
                     "deleted": 0,
                     "chroma_count": chroma_count,
+                    "elapsed_seconds": round(elapsed, 3),
                     "status": "UP_TO_DATE"
                 }
 
-            # 4. Process deletions
-            for del_id in deleted_ids:
-                logger.info(f"[DELETE STALE VECTOR] Removing segment ID '{del_id}' from ChromaDB...")
-                self.chroma_engine.delete_segment(del_id)
+            # Detail the changes
+            logger.info("─" * 76)
+            logger.info(f"[CHANGES QUEUED FOR RE-INDEXING]:")
+            for idx, (seg, reason) in enumerate(modified_segments, 1):
+                logger.info(f"  [{idx}] MODIFIED: {seg.segment_key}")
+                logger.info(f"      • Reason : {reason}")
+                logger.info(f"      • UUID   : {seg.id}")
+                logger.info(f"      • Entity : {seg.section} -> {seg.topic}")
+            for idx, seg in enumerate(new_segments, 1):
+                logger.info(f"  [{idx}] NEW: {seg.segment_key} (UUID: {seg.id})")
+            for idx, del_id in enumerate(deleted_ids, 1):
+                logger.info(f"  [{idx}] DELETED/STALE: UUID {del_id}")
 
-            # 5. Process new & modified segments with full 3-stage logging
+            # 4. Process deletions
+            if deleted_ids:
+                logger.info("─" * 76)
+                logger.info(f"[PURGING {len(deleted_ids)} STALE VECTOR(S)]")
+                for del_id in deleted_ids:
+                    logger.info(f"  • Removing stale segment ID '{del_id}' from ChromaDB...")
+                    self.chroma_engine.delete_segment(del_id)
+
+            # 5. Process modifications and new segments
+            logger.info("─" * 76)
+            total_reindex_count = len(modified_segments) + len(new_segments)
+            logger.info(f"[PHASE 3: EXECUTING RE-INDEXING PIPELINE FOR {total_reindex_count} SEGMENT(S)]")
             reindexed = []
-            for seg in modified_segments:
-                logger.info(f"[CHANGE DETECTED] Triggering re-index for modified segment '{seg.segment_key}' (ID: {seg.id})...")
+
+            for idx, (seg, reason) in enumerate(modified_segments, 1):
+                logger.info(f"\n>>> [ITEM {idx}/{total_reindex_count}] Re-indexing modified segment: '{seg.segment_key}' <<<")
                 res = self.sync_segment(segment_id=str(seg.id), session=sess)
                 reindexed.append(res)
 
-            for seg in new_segments:
-                logger.info(f"[NEW SEGMENT DETECTED] Triggering index for new segment '{seg.segment_key}' (ID: {seg.id})...")
+            offset = len(modified_segments)
+            for idx, seg in enumerate(new_segments, 1):
+                logger.info(f"\n>>> [ITEM {offset + idx}/{total_reindex_count}] Indexing new segment: '{seg.segment_key}' <<<")
                 res = self.sync_segment(segment_id=str(seg.id), session=sess)
                 reindexed.append(res)
 
             final_count = self.chroma_engine.count()
-            logger.info(f"[AUTO-SYNC FINISHED] Successfully processed {len(reindexed)} segment(s). ChromaDB final vector count: {final_count}")
+            elapsed = time.perf_counter() - t_start
+
+            # Invalidate in-memory schema registry so new DDL and column data types are immediately active
+            try:
+                load_erp_registry(force_reload=True)
+            except Exception as e:
+                logger.warning(f"Could not reload in-memory schema registry after sync: {e}")
+
+            logger.info("\n" + "=" * 76)
+            logger.info("  AUTO-SYNC COMPLETED SUCCESSFULLY")
+            logger.info("=" * 76)
+            logger.info(f"  • Overall Status      : SYNCHRONIZED")
+            logger.info(f"  • PostgreSQL Records  : {pg_count} active segments")
+            logger.info(f"  • Modified Re-indexed : {len(modified_segments)}")
+            logger.info(f"  • New Vectors Added   : {len(new_segments)}")
+            logger.info(f"  • Stale Vectors Purged: {len(deleted_ids)}")
+            logger.info(f"  • Final ChromaDB Total: {final_count} vectors")
+            logger.info(f"  • Execution Time      : {elapsed:.3f} seconds")
+            logger.info("=" * 76)
 
             return {
                 "total_changes": total_changes,
@@ -2621,6 +2704,7 @@ class ChromaPostgresSynchronizer:
                 "deleted": len(deleted_ids),
                 "reindexed_segments": [r["segment_key"] for r in reindexed],
                 "final_count": final_count,
+                "elapsed_seconds": round(elapsed, 3),
                 "status": "SYNCHRONIZED"
             }
 

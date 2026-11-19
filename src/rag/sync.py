@@ -9,8 +9,21 @@ Usage:
 """
 import sys
 import json
+from src.config import get_logger
 from src.rag.service import auto_sync_chroma
 
+logger = get_logger("src.rag.sync")
+
+
+def run_sync() -> int:
+    """Executes full automated 2-tier synchronization with comprehensive logging."""
+    try:
+        result = auto_sync_chroma()
+        return 0
+    except Exception as e:
+        logger.error(f"[AUTO-SYNC FATAL ERROR] Failed to complete sync: {e}", exc_info=True)
+        return 1
+
+
 if __name__ == "__main__":
-    result = auto_sync_chroma()
-    sys.exit(0)
+    sys.exit(run_sync())
