@@ -20,11 +20,7 @@ from src.rag.models import (
     DomainModel,
     KnowledgeTableModel,
     KnowledgeColumnModel,
-    TableDependencyModel,
     KnowledgeSegmentModel,
-    SegmentVersionModel,
-    EmbeddingJobModel,
-    SegmentVectorModel,
 )
 from src.rag.service import (
     ChromaPostgresSynchronizer,
@@ -135,11 +131,10 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
             self.assertEqual(seg2.id, test_uuid)  # UUID strictly preserved!
             self.assertEqual(seg2.version, 2)     # Version incremented!
 
-            # 3. Verify version history in segment_versions
-            history = repo.get_segment_history(test_uuid)
-            self.assertEqual(len(history), 1)
-            self.assertEqual(history[0].version, 1)
-            self.assertEqual(history[0].content, initial_content)
+            # 3. Verify version tracking on knowledge_segments
+            refetched = repo.get_segment_by_id(test_uuid)
+            self.assertEqual(refetched.version, 2)
+            self.assertEqual(refetched.content, modified_content)
 
             # Cleanup test segment
             session.query(KnowledgeSegmentModel).filter(KnowledgeSegmentModel.id == test_uuid).delete()

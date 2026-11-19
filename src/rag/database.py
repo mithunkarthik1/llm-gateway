@@ -38,10 +38,7 @@ from src.rag.models import (
     DomainModel,
     KnowledgeTableModel,
     KnowledgeColumnModel,
-    TableDependencyModel,
     KnowledgeSegmentModel,
-    SegmentVersionModel,
-    EmbeddingJobModel,
     generate_uuid,
     utc_now,
 )
@@ -150,18 +147,15 @@ def init_db(db_url: Optional[str] = None, drop_all: bool = False):
         logger.info("Creating knowledge base tables if not present...")
         Base.metadata.create_all(bind=engine)
 
-        # Auto-migrate segment_key column and drop legacy content_hash columns
+        # Ensure only the 4 minimal tables exist: domains, knowledge_tables, knowledge_columns, knowledge_segments
         try:
             with engine.begin() as conn:
+                for tbl in ["segment_vectors", "embedding_jobs", "segment_versions", "table_dependencies"]:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE;"))
                 conn.execute(text("ALTER TABLE knowledge_segments ADD COLUMN IF NOT EXISTS segment_key VARCHAR(256);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_knowledge_segments_segment_key ON knowledge_segments(segment_key);"))
-                conn.execute(text("ALTER TABLE knowledge_tables DROP COLUMN IF EXISTS content_hash;"))
-                conn.execute(text("ALTER TABLE knowledge_segments DROP COLUMN IF EXISTS content_hash;"))
-                conn.execute(text("ALTER TABLE segment_versions DROP COLUMN IF EXISTS content_hash;"))
-                conn.execute(text("ALTER TABLE embedding_jobs DROP COLUMN IF EXISTS content_hash;"))
-                conn.execute(text("ALTER TABLE segment_vectors DROP COLUMN IF EXISTS content_hash;"))
         except Exception as e:
-            logger.debug(f"Column migration check note: {e}")
+            logger.debug(f"Table cleanup note: {e}")
 
         logger.info("Knowledge base tables initialized successfully.")
     except Exception as e:
@@ -614,33 +608,46 @@ class KnowledgeBaseRepository:
         self.session.flush()
         return new_col, True
 
-    # 4. Table Dependencies
+    # 4. Table Dependencies (Dynamically derived from knowledge_columns foreign keys)
     def add_table_dependency(
         self,
         source_table_id: uuid.UUID,
         referenced_table_id: uuid.UUID,
         relationship_type: str = "FOREIGN_KEY"
-    ) -> Tuple[TableDependencyModel, bool]:
-        existing = self.session.query(TableDependencyModel).filter(
-            TableDependencyModel.source_table_id == source_table_id,
-            TableDependencyModel.referenced_table_id == referenced_table_id
-        ).first()
-        if existing:
-            return existing, False
+    ) -> Tuple[Any, bool]:
+        """Backward compatibility helper - dependencies are stored via column FKs."""
+        return None, False
 
-        dep = TableDependencyModel(
-            source_table_id=source_table_id,
-            referenced_table_id=referenced_table_id,
-            relationship_type=relationship_type
-        )
-        self.session.add(dep)
-        self.session.flush()
-        return dep, True
-
-    def list_dependencies_for_table(self, table_id: uuid.UUID) -> List[TableDependencyModel]:
-        return self.session.query(TableDependencyModel).filter(
-            TableDependencyModel.source_table_id == table_id
+    def list_dependencies_for_table(self, table_id: uuid.UUID) -> List[Any]:
+        """Resolves foreign key dependencies directly from knowledge_columns."""
+        cols = self.session.query(KnowledgeColumnModel).filter(
+            KnowledgeColumnModel.table_id == table_id,
+            KnowledgeColumnModel.is_foreign_key.is_(True)
         ).all()
+        deps = []
+        seen_refs = set()
+        for c in cols:
+            ref_t = c.references_table
+            if not ref_t and c.references_column:
+                ref_t = c.references_column.split(".")[0]
+            if not ref_t and c.data_type and "REFERENCES" in c.data_type.upper():
+                import re
+                m = re.search(r"REFERENCES\s+([a-zA-Z0-9_]+)", c.data_type, re.IGNORECASE)
+                if m:
+                    ref_t = m.group(1)
+            if ref_t and ref_t.lower() not in seen_refs:
+                ref_tbl = self.session.query(KnowledgeTableModel).filter(
+                    KnowledgeTableModel.table_name == ref_t
+                ).first()
+                if ref_tbl:
+                    seen_refs.add(ref_t.lower())
+                    class _Dep:
+                        def __init__(self, src, ref, rel):
+                            self.source_table_id = src
+                            self.referenced_table_id = ref
+                            self.relationship_type = rel
+                    deps.append(_Dep(table_id, ref_tbl.id, "FOREIGN_KEY"))
+        return deps
 
     # 5. Knowledge Segments (2-Tier: segment_id + segment_key)
     def get_segment_by_id(self, segment_uuid: uuid.UUID) -> Optional[KnowledgeSegmentModel]:
@@ -778,49 +785,25 @@ class KnowledgeBaseRepository:
         segment_id: uuid.UUID,
         version: int,
         content: str
-    ) -> SegmentVersionModel:
-        existing = self.session.query(SegmentVersionModel).filter(
-            SegmentVersionModel.segment_id == segment_id,
-            SegmentVersionModel.version == version
-        ).first()
-        if existing:
-            return existing
+    ) -> Any:
+        """Deprecated: Segment versions are maintained directly on knowledge_segments.version."""
+        return None
 
-        version_record = SegmentVersionModel(
-            segment_id=segment_id,
-            version=version,
-            content=content,
-            changed_at=utc_now()
-        )
-        self.session.add(version_record)
-        self.session.flush()
-        return version_record
+    def get_segment_history(self, segment_id: uuid.UUID) -> List[Any]:
+        """Deprecated: Returns current segment record."""
+        seg = self.get_segment_by_id(segment_id)
+        return [seg] if seg else []
 
-    def get_segment_history(self, segment_id: uuid.UUID) -> List[SegmentVersionModel]:
-        return self.session.query(SegmentVersionModel).filter(
-            SegmentVersionModel.segment_id == segment_id
-        ).order_by(SegmentVersionModel.version.desc()).all()
-
-    # 6. Embedding Jobs (Asynchronous Synchronization Queue)
+    # 6. Embedding Jobs (Legacy queue stubs - replaced by direct ChromaDB sync)
     def create_embedding_job(
         self,
         segment_id: uuid.UUID,
         operation: str = "INSERT"
-    ) -> EmbeddingJobModel:
-        job = EmbeddingJobModel(
-            segment_id=segment_id,
-            operation=operation,
-            status="PENDING",
-            created_at=utc_now()
-        )
-        self.session.add(job)
-        self.session.flush()
-        return job
+    ) -> Any:
+        return None
 
-    def get_pending_embedding_jobs(self, limit: int = 100) -> List[EmbeddingJobModel]:
-        return self.session.query(EmbeddingJobModel).filter(
-            EmbeddingJobModel.status == "PENDING"
-        ).order_by(EmbeddingJobModel.created_at.asc()).limit(limit).all()
+    def get_pending_embedding_jobs(self, limit: int = 100) -> List[Any]:
+        return []
 
     def update_job_status(
         self,
@@ -828,14 +811,7 @@ class KnowledgeBaseRepository:
         status: str,
         error_message: Optional[str] = None
     ):
-        job = self.session.query(EmbeddingJobModel).filter(EmbeddingJobModel.id == job_id).first()
-        if job:
-            job.status = status
-            job.error_message = error_message
-            if status in ("COMPLETED", "FAILED"):
-                job.processed_at = utc_now()
-            if status == "FAILED":
-                job.retry_count += 1
+        pass
 
 
 # =============================================================================
@@ -974,6 +950,18 @@ class JSONKnowledgeBaseMigrator:
                 data_type = cdata.get("data_type", "VARCHAR(255)")
                 ref_tbl = cdata.get("references_table")
                 ref_col = cdata.get("references_column")
+                if not ref_tbl and cdata.get("references"):
+                    ref_parts = str(cdata["references"]).split(".")
+                    ref_tbl = ref_parts[0]
+                    if len(ref_parts) > 1:
+                        ref_col = ref_parts[1]
+                elif not ref_tbl and "REFERENCES" in data_type.upper():
+                    import re
+                    m = re.search(r"REFERENCES\s+([a-zA-Z0-9_]+)(?:\(([a-zA-Z0-9_]+)\))?", data_type, re.IGNORECASE)
+                    if m:
+                        ref_tbl = m.group(1)
+                        if m.group(2):
+                            ref_col = m.group(2)
 
                 col_obj, c_created = repo.upsert_column(
                     table_uuid=tbl_obj.id,
@@ -996,13 +984,7 @@ class JSONKnowledgeBaseMigrator:
                 if ref_tbl and str(ref_tbl).strip().lower() in table_obj_map:
                     ref_tbl_clean = str(ref_tbl).strip().lower()
                     parent_tbl = table_obj_map[ref_tbl_clean]
-                    _, dep_created = repo.add_table_dependency(
-                        source_table_id=tbl_obj.id,
-                        referenced_table_id=parent_tbl.id,
-                        relationship_type="FOREIGN_KEY"
-                    )
-                    if dep_created:
-                        stats["dependencies_created"] += 1
+                    stats["dependencies_created"] += 1
 
                     all_chunks.append(build_relationship_chunk(
                         domain_data=domain_data,
@@ -1037,12 +1019,8 @@ class JSONKnowledgeBaseMigrator:
 
             if op == "INSERT":
                 stats["segments_created"] += 1
-                repo.create_embedding_job(seg_obj.id, operation="INSERT")
-                stats["embedding_jobs_created"] += 1
             elif op == "UPDATE":
                 stats["segments_updated"] += 1
-                repo.create_embedding_job(seg_obj.id, operation="UPDATE")
-                stats["embedding_jobs_created"] += 1
             else:
                 stats["segments_skipped"] += 1
 

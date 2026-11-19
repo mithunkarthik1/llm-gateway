@@ -35,11 +35,7 @@ from src.rag.models import (
     DomainModel,
     KnowledgeTableModel,
     KnowledgeColumnModel,
-    TableDependencyModel,
     KnowledgeSegmentModel,
-    SegmentVersionModel,
-    EmbeddingJobModel,
-    SegmentVectorModel,
 )
 from src.rag.database import (
     get_engine,
@@ -64,6 +60,9 @@ from src.rag.service import (
     load_erp_registry,
     ERPEnterpriseRAGService,
     build_rag_augmented_prompt,
+    reset_rag_cache,
+)
+from utils.sync_chroma import (
     get_embedding_model,
     get_chroma_engine,
     ChromaSchemaEngine,
@@ -71,6 +70,7 @@ from src.rag.service import (
     get_embedding_synchronizer,
     sync_chroma_from_postgres,
     auto_sync_chroma,
+    reset_chroma_client,
 )
 
 __all__ = [
@@ -80,6 +80,8 @@ __all__ = [
     "resolve_best_rag_model",
     "get_rag_service",
     "load_erp_registry",
+    "reset_rag_cache",
+    "reset_chroma_client",
     "ERPEnterpriseRAGService",
     # Prompts
     "RAG_SYSTEM_PROMPT",
@@ -113,11 +115,7 @@ __all__ = [
     "DomainModel",
     "KnowledgeTableModel",
     "KnowledgeColumnModel",
-    "TableDependencyModel",
     "KnowledgeSegmentModel",
-    "SegmentVersionModel",
-    "EmbeddingJobModel",
-    "SegmentVectorModel",
     # Pydantic Schemas
     "TableSchema",
     "RAGQueryRequest",

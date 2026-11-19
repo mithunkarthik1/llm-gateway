@@ -125,10 +125,12 @@ try:
     from utils.domain_priority import (
         DOMAIN_PRIMARY_TABLES,
         TABLE_PRIMARY_COLUMNS_MAP,
+        prioritize_table_columns,
     )
     from utils.schema_synonyms import (
         TABLE_SYNONYMS,
         NONEXISTENT_TABLE_PATTERNS,
+        resolve_canonical_table_name,
     )
 except Exception as e:
     logger.warning(f"Error importing domain priority or schema synonym utilities: {e}")
@@ -136,6 +138,8 @@ except Exception as e:
     TABLE_PRIMARY_COLUMNS_MAP = {}
     TABLE_SYNONYMS = {}
     NONEXISTENT_TABLE_PATTERNS = []
+    prioritize_table_columns = None
+    resolve_canonical_table_name = None
 
 __all__ = [
     "DATABASE_URL",
@@ -160,4 +164,6 @@ __all__ = [
     "TABLE_PRIMARY_COLUMNS_MAP",
     "TABLE_SYNONYMS",
     "NONEXISTENT_TABLE_PATTERNS",
+    "prioritize_table_columns",
+    "resolve_canonical_table_name",
 ]

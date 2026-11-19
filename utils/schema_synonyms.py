@@ -2,7 +2,8 @@
 Canonical Schema Synonyms & Anti-Hallucination Patterns.
 Provides natural language synonym mappings to master tables and boundary rejection lists.
 """
-from typing import Dict, List
+import re
+from typing import Dict, List, Optional, Any
 
 # =====================================================================
 # Canonical Schema Synonyms (Natural Language -> Canonical Master Tables)
@@ -183,7 +184,26 @@ NONEXISTENT_TABLE_PATTERNS: List[str] = [
     "customer payment history"
 ]
 
+def resolve_canonical_table_name(text: str, all_tables: Dict[str, Any]) -> Optional[str]:
+    """Resolves table name by checking exact names, underscores/spaces, synonyms, and word boundaries."""
+    t_lower = text.lower().strip()
+    if t_lower in all_tables:
+        return t_lower
+    if t_lower.replace(" ", "_") in all_tables:
+        return t_lower.replace(" ", "_")
+    if t_lower in TABLE_SYNONYMS:
+        return TABLE_SYNONYMS[t_lower]
+    for t in sorted(all_tables.keys(), key=len, reverse=True):
+        if re.search(r"\b" + re.escape(t) + r"\b", t_lower) or re.search(r"\b" + re.escape(t.replace("_", " ")) + r"\b", t_lower):
+            return t
+    for syn, t in sorted(TABLE_SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True):
+        if re.search(r"\b" + re.escape(syn) + r"\b", t_lower):
+            return t
+    return None
+
+
 __all__ = [
     "TABLE_SYNONYMS",
     "NONEXISTENT_TABLE_PATTERNS",
+    "resolve_canonical_table_name",
 ]

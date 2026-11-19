@@ -6,6 +6,12 @@ services:
     env_file: .env
     environment:
       - IS_DOCKER=true
+      - DB_HOST=host.docker.internal
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./src:/app/src
+      - ./utils:/app/utils
+      - ./src/rag/data/chroma_db:/app/src/rag/data/chroma_db
     ports:
       - "8000:8000"
     extra_hosts:

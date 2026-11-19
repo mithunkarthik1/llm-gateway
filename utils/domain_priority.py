@@ -78,7 +78,47 @@ TABLE_PRIMARY_COLUMNS_MAP: Dict[str, List[str]] = {
     "prescriptions": ["id", "patient_id", "doctor_id", "prescription_date", "notes"]
 }
 
+def prioritize_table_columns(table_name: str, all_cols: List[str], include_pk: bool = True) -> List[str]:
+    """
+    Ranks columns by business importance for a given table:
+    1. Primary Key ('id') if include_pk is True
+    2. Primary business code/identifier/name
+    3. Core business value/amount/status/date
+    4. Foreign keys / attributes
+    5. Audit columns (created_at, updated_at, etc.)
+    """
+    tname_lower = table_name.lower()
+    if tname_lower in TABLE_PRIMARY_COLUMNS_MAP:
+        ranked = [c for c in TABLE_PRIMARY_COLUMNS_MAP[tname_lower] if c in all_cols]
+        for c in all_cols:
+            if c not in ranked:
+                ranked.append(c)
+    else:
+        def col_rank(c: str) -> int:
+            cl = c.lower()
+            if cl in ("id", "primary_key"):
+                return 0
+            if any(k in cl for k in ["code", "number", "sku", "name", "title"]):
+                return 1
+            if any(k in cl for k in ["amount", "total", "price", "salary", "date", "status", "type", "email"]):
+                return 2
+            if cl.endswith("_id"):
+                return 3
+            if any(k in cl for k in ["created_at", "updated_at", "password_hash", "deleted_at"]):
+                return 5
+            return 4
+        ranked = sorted(all_cols, key=col_rank)
+
+    if not include_pk:
+        ranked = [c for c in ranked if c.lower() not in ("id", "primary_key")]
+    elif "id" in all_cols and (not ranked or ranked[0].lower() != "id"):
+        ranked = ["id"] + [c for c in ranked if c.lower() != "id"]
+
+    return ranked
+
+
 __all__ = [
     "DOMAIN_PRIMARY_TABLES",
     "TABLE_PRIMARY_COLUMNS_MAP",
+    "prioritize_table_columns",
 ]
