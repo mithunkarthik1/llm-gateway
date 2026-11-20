@@ -154,6 +154,99 @@ def init_db(db_url: Optional[str] = None, drop_all: bool = False):
                     conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE;"))
                 conn.execute(text("ALTER TABLE knowledge_segments ADD COLUMN IF NOT EXISTS segment_key VARCHAR(256);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_knowledge_segments_segment_key ON knowledge_segments(segment_key);"))
+
+                # Auto-cascading trigger: When knowledge_columns is updated, automatically
+                # updates knowledge_tables.sql_definition and knowledge_segments versions!
+                conn.execute(text("""
+                CREATE OR REPLACE FUNCTION trg_cascade_column_update_func()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    v_tbl_name TEXT;
+                    v_pk_suffix TEXT;
+                BEGIN
+                    IF (OLD.data_type IS DISTINCT FROM NEW.data_type) OR (OLD.is_primary_key IS DISTINCT FROM NEW.is_primary_key) THEN
+                        SELECT table_name INTO v_tbl_name FROM knowledge_tables WHERE id = NEW.table_id;
+                        
+                        IF v_tbl_name IS NOT NULL THEN
+                            v_pk_suffix := CASE WHEN NEW.is_primary_key THEN ' PRIMARY KEY' ELSE '' END;
+                            
+                            -- 1. Cascade update to knowledge_tables.sql_definition
+                            UPDATE knowledge_tables
+                            SET sql_definition = REGEXP_REPLACE(
+                                    sql_definition,
+                                    '(' || NEW.column_name || '\\s+)[^,;\\n]+',
+                                    '\\1' || NEW.data_type || v_pk_suffix,
+                                    'i'
+                                ),
+                                updated_at = NOW()
+                            WHERE id = NEW.table_id;
+
+                            -- 2. Cascade update to column segment in knowledge_segments
+                            UPDATE knowledge_segments
+                            SET content = REGEXP_REPLACE(
+                                    REGEXP_REPLACE(content, 'Data Type: [^\\n]+', 'Data Type: ' || NEW.data_type, 'i'),
+                                    'Primary Key: [^\\n]+', 'Primary Key: ' || CASE WHEN NEW.is_primary_key THEN 'Yes' ELSE 'No' END, 'i'
+                                ),
+                                version = version + 1,
+                                updated_at = NOW()
+                            WHERE table_id = NEW.table_id 
+                              AND LOWER(segment_name) = LOWER(v_tbl_name || '.' || NEW.column_name);
+
+                            -- 3. Cascade update to table segment in knowledge_segments
+                            UPDATE knowledge_segments
+                            SET content = REGEXP_REPLACE(
+                                    content,
+                                    '(' || NEW.column_name || '\\s+)[^,;\\n]+',
+                                    '\\1' || NEW.data_type || v_pk_suffix,
+                                    'i'
+                                ),
+                                version = version + 1,
+                                updated_at = NOW()
+                            WHERE table_id = NEW.table_id 
+                              AND segment_type = 'table';
+                        END IF;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                DROP TRIGGER IF EXISTS trg_cascade_column_update ON knowledge_columns;
+                CREATE TRIGGER trg_cascade_column_update
+                AFTER UPDATE OF data_type, is_primary_key ON knowledge_columns
+                FOR EACH ROW
+                EXECUTE FUNCTION trg_cascade_column_update_func();
+
+                -- Helper stored procedure: alter_column('table', 'column', data_type, is_pk)
+                CREATE OR REPLACE FUNCTION alter_column(
+                    p_table TEXT,
+                    p_column TEXT,
+                    p_data_type TEXT DEFAULT NULL,
+                    p_is_pk BOOLEAN DEFAULT NULL
+                ) RETURNS TEXT AS $$
+                DECLARE
+                    v_table_id UUID;
+                    v_col_id UUID;
+                BEGIN
+                    SELECT id INTO v_table_id FROM knowledge_tables WHERE LOWER(table_name) = LOWER(p_table) LIMIT 1;
+                    IF v_table_id IS NULL THEN
+                        RAISE EXCEPTION 'Table "%" not found in knowledge_tables', p_table;
+                    END IF;
+
+                    SELECT id INTO v_col_id FROM knowledge_columns WHERE table_id = v_table_id AND LOWER(column_name) = LOWER(p_column) LIMIT 1;
+                    IF v_col_id IS NULL THEN
+                        RAISE EXCEPTION 'Column "%" not found in table "%"', p_column, p_table;
+                    END IF;
+
+                    UPDATE knowledge_columns
+                    SET data_type = COALESCE(p_data_type, data_type),
+                        is_primary_key = COALESCE(p_is_pk, is_primary_key),
+                        updated_at = NOW()
+                    WHERE id = v_col_id;
+
+                    RETURN FORMAT('Successfully altered %s.%s. All dependent tables, DDLs, and segments auto-cascaded.', p_table, p_column);
+                END;
+                $$ LANGUAGE plpgsql;
+                """))
         except Exception as e:
             logger.debug(f"Table cleanup note: {e}")
 
@@ -771,12 +864,6 @@ class KnowledgeBaseRepository:
         if new_segment_key:
             seg.segment_key = new_segment_key
         seg.updated_at = utc_now()
-
-        # Enqueue ChromaDB synchronization job
-        self.create_embedding_job(
-            segment_id=seg.id,
-            operation="UPDATE"
-        )
         self.session.flush()
         return seg, "UPDATE"
 
@@ -786,32 +873,7 @@ class KnowledgeBaseRepository:
         version: int,
         content: str
     ) -> Any:
-        """Deprecated: Segment versions are maintained directly on knowledge_segments.version."""
         return None
-
-    def get_segment_history(self, segment_id: uuid.UUID) -> List[Any]:
-        """Deprecated: Returns current segment record."""
-        seg = self.get_segment_by_id(segment_id)
-        return [seg] if seg else []
-
-    # 6. Embedding Jobs (Legacy queue stubs - replaced by direct ChromaDB sync)
-    def create_embedding_job(
-        self,
-        segment_id: uuid.UUID,
-        operation: str = "INSERT"
-    ) -> Any:
-        return None
-
-    def get_pending_embedding_jobs(self, limit: int = 100) -> List[Any]:
-        return []
-
-    def update_job_status(
-        self,
-        job_id: uuid.UUID,
-        status: str,
-        error_message: Optional[str] = None
-    ):
-        pass
 
 
 # =============================================================================
@@ -1029,7 +1091,6 @@ class JSONKnowledgeBaseMigrator:
             f"Domains: {stats['domains_created']} created, {stats['domains_updated']} updated | "
             f"Tables: {stats['tables_created']} created, {stats['tables_updated']} updated | "
             f"Columns: {stats['columns_created']} created, {stats['columns_updated']} updated | "
-            f"Segments: {stats['segments_created']} created, {stats['segments_updated']} updated, {stats['segments_skipped']} skipped | "
-            f"Jobs Queued: {stats['embedding_jobs_created']}"
+            f"Segments: {stats['segments_created']} created, {stats['segments_updated']} updated, {stats['segments_skipped']} skipped"
         )
         return stats

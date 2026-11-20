@@ -22,16 +22,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from src.config import get_logger
-from src.rag.config import (
-    CHROMA_COLLECTION_NAME,
-    CHROMA_DATA_DIR,
-    CHROMA_SIMILARITY_THRESHOLD,
-    CHROMA_TOP_K,
-    EMBEDDING_DIMENSION,
-    EMBEDDING_MODEL_NAME,
-)
 
 logger = get_logger("utils.sync_chroma")
+
+# Default Vector & Embedding Configuration Constants
+CHROMA_DATA_DIR = Path("src/rag/data/chroma_db")
+CHROMA_COLLECTION_NAME = "nexus_erp_knowledge"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_DIMENSION = 384
+CHROMA_TOP_K = 10
+CHROMA_SIMILARITY_THRESHOLD = 0.35
 
 # =============================================================================
 # Local Embedding Model (SentenceTransformer)
@@ -58,6 +58,26 @@ def get_embedding_model():
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
             _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
     return _EMBEDDING_MODEL
+
+
+# Load any overrides from config if available
+try:
+    from src.rag.config import (
+        CHROMA_COLLECTION_NAME as _CFG_COLL_NAME,
+        CHROMA_DATA_DIR as _CFG_DATA_DIR,
+        CHROMA_SIMILARITY_THRESHOLD as _CFG_SIM_THRESH,
+        CHROMA_TOP_K as _CFG_TOP_K,
+        EMBEDDING_DIMENSION as _CFG_DIM,
+        EMBEDDING_MODEL_NAME as _CFG_MODEL_NAME,
+    )
+    CHROMA_COLLECTION_NAME = _CFG_COLL_NAME
+    CHROMA_DATA_DIR = _CFG_DATA_DIR
+    CHROMA_SIMILARITY_THRESHOLD = _CFG_SIM_THRESH
+    CHROMA_TOP_K = _CFG_TOP_K
+    EMBEDDING_DIMENSION = _CFG_DIM
+    EMBEDDING_MODEL_NAME = _CFG_MODEL_NAME
+except Exception:
+    pass
 
 
 # =============================================================================

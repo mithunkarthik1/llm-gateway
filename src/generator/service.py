@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from optimum.onnxruntime import ORTModelForCausalLM
+try:
+    from optimum.onnxruntime import ORTModelForCausalLM
+except Exception:
+    ORTModelForCausalLM = None
 from transformers import AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from src.config import MODEL_DIR, MODEL_SUBFOLDER, MODEL_FILE, get_logger

@@ -1,209 +1,240 @@
 """
-Canonical Schema Synonyms & Anti-Hallucination Patterns.
-Provides natural language synonym mappings to master tables and boundary rejection lists.
+Dynamic Canonical Schema Synonyms & Anti-Hallucination Engine.
+Provides natural language synonym mappings to canonical database tables and boundary rejection lists
+derived dynamically from the PostgreSQL knowledge base without static hardcoding.
 """
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 
-# =====================================================================
-# Canonical Schema Synonyms (Natural Language -> Canonical Master Tables)
-# =====================================================================
 
-TABLE_SYNONYMS: Dict[str, str] = {
-    # Finance domain synonyms
-    "customer invoices": "customer_invoices",
-    "customer invoice": "customer_invoices",
-    "invoices": "customer_invoices",
-    "invoice": "customer_invoices",
-    "finance customers": "finance_customers",
-    "finance customer": "finance_customers",
-    "customers": "finance_customers",
-    "customer": "finance_customers",
-    "chart of accounts": "chart_of_accounts",
-    "chart of account": "chart_of_accounts",
-    "gl accounts": "chart_of_accounts",
-    "gl account": "chart_of_accounts",
-    "fiscal periods": "fiscal_periods",
-    "fiscal period": "fiscal_periods",
-    "fiscal": "fiscal_periods",
-    "journal entries": "journal_entries",
-    "journal entry": "journal_entries",
-    "accounting entry": "journal_entries",
-    "accounting entries": "journal_entries",
-    "payments": "payments",
-    "payment": "payments",
+def get_word_inflections(w: str) -> List[str]:
+    """Dynamically generates singular and plural variations for natural language terms."""
+    w_low = w.lower().strip()
+    if not w_low:
+        return []
 
-    # HRMS domain synonyms
-    "hrms departments": "hrms_departments",
-    "hrms department": "hrms_departments",
-    "departments": "hrms_departments",
-    "department": "hrms_departments",
-    "hrms designations": "hrms_designations",
-    "hrms designation": "hrms_designations",
-    "designations": "hrms_designations",
-    "designation": "hrms_designations",
-    "hrms employees": "hrms_employees",
-    "hrms employee": "hrms_employees",
-    "employees": "hrms_employees",
-    "attendance": "hrms_attendance",
-    "employee attendance": "hrms_attendance",
-    "attendance records": "hrms_attendance",
-    "hrms attendance": "hrms_attendance",
-    "payrolls": "hrms_payrolls",
-    "payroll": "hrms_payrolls",
-    "hrms payroll": "hrms_payrolls",
-    "hrms payrolls": "hrms_payrolls",
-    "employee payroll": "hrms_payrolls",
+    res = [w_low]
+    if w_low.endswith("ies") and len(w_low) > 4:
+        res.append(w_low[:-3] + "y")
+    elif w_low.endswith("es") and len(w_low) > 4:
+        if any(w_low.endswith(end) for end in ["ches", "shes", "sses", "xes"]):
+            res.append(w_low[:-2])
+        else:
+            res.append(w_low[:-1])
+    elif w_low.endswith("s") and len(w_low) > 3 and not w_low.endswith("ss"):
+        res.append(w_low[:-1])
+    elif w_low.endswith("y") and len(w_low) > 3:
+        res.append(w_low[:-1] + "ies")
+    else:
+        res.append(w_low + "s")
+    return list(dict.fromkeys(res))
 
-    # Supply Chain domain synonyms
-    "product items": "product_items",
-    "product item": "product_items",
-    "product details": "product_items",
-    "inventory items": "product_items",
-    "inventory item": "product_items",
-    "inventory_items": "product_items",
-    "products table": "product_items",
-    "items table": "product_items",
-    "items": "product_items",
-    "inventory stocks": "inventory_stocks",
-    "inventory stock": "inventory_stocks",
-    "inventory_stocks": "inventory_stocks",
-    "inventory_stock": "inventory_stocks",
-    "stock information": "inventory_stocks",
-    "stock details": "inventory_stocks",
-    "inventory": "inventory_stocks",
-    "stocks": "inventory_stocks",
-    "stock": "inventory_stocks",
-    "stock levels": "inventory_stocks",
-    "purchase orders": "purchase_orders",
-    "purchase order": "purchase_orders",
-    "po": "purchase_orders",
-    "orders": "purchase_orders",
-    "order": "purchase_orders",
-    "warehouse information": "warehouses",
-    "warehouse details": "warehouses",
-    "warehouses": "warehouses",
-    "warehouse": "warehouses",
-    "supplier information": "suppliers",
-    "supplier details": "suppliers",
-    "suppliers": "suppliers",
-    "supplier": "suppliers",
 
-    # E-Commerce domain synonyms
-    "categories": "categories",
-    "category": "categories",
-    "product categories": "categories",
-    "product category": "categories",
-    "ecommerce categories": "categories",
-    "addresses": "addresses",
-    "address": "addresses",
-    "customer addresses": "addresses",
-    "shipping addresses": "addresses",
-    "product variants": "product_variants",
-    "product variant": "product_variants",
-    "variants": "product_variants",
-    "variant": "product_variants",
-    "product images": "product_images",
-    "product image": "product_images",
-    "carts": "carts",
-    "cart": "carts",
-    "shopping carts": "carts",
-    "shopping cart": "carts",
-    "cart items": "cart_items",
-    "cart item": "cart_items",
-    "coupons": "coupons",
-    "coupon": "coupons",
-    "promo codes": "coupons",
-    "discount codes": "coupons",
-    "order items": "order_items",
-    "order item": "order_items",
-    "product reviews": "product_reviews",
-    "product review": "product_reviews",
-    "reviews": "product_reviews",
-    "wishlists": "wishlists",
-    "wishlist": "wishlists",
-    "saved items": "wishlists",
-    "order refunds": "order_refunds",
-    "order refund": "order_refunds",
-    "refunds": "order_refunds",
+def build_dynamic_table_synonyms(all_tables: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Dynamically generates natural language synonym mappings for ANY table catalog:
+    1. Underscored and spaced canonical names
+    2. Morphological inflections (singular <-> plural)
+    3. Domain prefix stripping (e.g. 'hrms_employees' -> 'employees', 'employee')
+    4. Metadata keywords stored directly in PostgreSQL
+    5. Standard abbreviations and business equivalences
+    """
+    if not all_tables:
+        return {}
 
-    # Healthcare domain synonyms
-    "doctors": "doctors",
-    "doctor": "doctors",
-    "physicians": "doctors",
-    "physician": "doctors",
-    "patients": "patients",
-    "patient": "patients",
-    "hospital rooms": "hospital_rooms",
-    "hospital room": "hospital_rooms",
-    "rooms": "hospital_rooms",
-    "patient admissions": "patient_admissions",
-    "patient admission": "patient_admissions",
-    "admissions": "patient_admissions",
-    "vital signs": "vital_signs",
-    "vital sign": "vital_signs",
-    "vitals": "vital_signs",
-    "patient allergies": "patient_allergies",
-    "patient allergy": "patient_allergies",
-    "allergies": "patient_allergies",
-    "appointments": "appointments",
-    "appointment": "appointments",
-    "doctor appointments": "appointments",
-    "medical records": "medical_records",
-    "medical record": "medical_records",
-    "clinical records": "medical_records",
-    "medications": "medications",
-    "medication": "medications",
-    "drugs": "medications",
-    "prescriptions": "prescriptions",
-    "prescription": "prescriptions",
-    "prescription items": "prescription_items",
-    "prescription item": "prescription_items",
-    "lab tests": "lab_tests",
-    "lab test": "lab_tests",
-    "laboratory tests": "lab_tests",
-    "lab orders": "lab_orders",
-    "lab order": "lab_orders",
-    "insurance claims": "insurance_claims",
-    "insurance claim": "insurance_claims",
-    "patient bills": "patient_bills",
-    "patient bill": "patient_bills",
-    "hospital bills": "patient_bills",
-}
+    syn_map: Dict[str, str] = {}
+
+    def add_synonym(syn: str, target: str):
+        syn_c = syn.lower().strip()
+        if syn_c and syn_c not in syn_map:
+            syn_map[syn_c] = target
+
+    for tname, tobj in all_tables.items():
+        t_low = tname.lower()
+        t_space = t_low.replace("_", " ")
+
+        # 1. Canonical full names
+        add_synonym(t_low, t_low)
+        add_synonym(t_space, t_low)
+
+        # 2. Inflections of full name
+        for inf in get_word_inflections(t_space):
+            add_synonym(inf, t_low)
+            add_synonym(inf.replace(" ", "_"), t_low)
+
+        # 3. Domain prefix stripping (e.g., 'hrms_departments' -> 'departments', 'hrms_employees' -> 'employees')
+        parts = t_low.split("_")
+        if len(parts) >= 2 and parts[0] in ("hrms", "erp"):
+            suffix = "_".join(parts[1:])
+            suffix_space = suffix.replace("_", " ")
+            add_synonym(suffix, t_low)
+            add_synonym(suffix_space, t_low)
+            for inf in get_word_inflections(suffix_space):
+                add_synonym(inf, t_low)
+                add_synonym(inf.replace(" ", "_"), t_low)
+
+        # 4. Table metadata keywords from database catalog
+        for kw in tobj.get("keywords", []):
+            kw_clean = str(kw).lower().strip()
+            if kw_clean and len(kw_clean) >= 3:
+                add_synonym(kw_clean, t_low)
+                add_synonym(kw_clean.replace(" ", "_"), t_low)
+                for inf in get_word_inflections(kw_clean):
+                    add_synonym(inf, t_low)
+                    add_synonym(inf.replace(" ", "_"), t_low)
+
+    # 5. Dynamic acronyms and abbreviations derived from multi-word table names
+    for tname in all_tables.keys():
+        t_low = tname.lower()
+        parts = t_low.split("_")
+        if len(parts) >= 2:
+            acr = "".join(p[0] for p in parts)
+            if len(acr) >= 2 and acr not in all_tables:
+                add_synonym(acr, t_low)
+
+    return syn_map
+
+
+class DynamicTableSynonyms(dict):
+    """
+    Dynamic dictionary proxy for TABLE_SYNONYMS.
+    Automatically generates and caches synonyms from active PostgreSQL knowledge base tables.
+    Zero hardcoded static dictionaries: seamlessly adapts to any newly uploaded domain.
+    """
+    def __init__(self):
+        super().__init__()
+        self._synonyms_cache: Optional[Dict[str, str]] = None
+
+    def _ensure_synonyms(self) -> Dict[str, str]:
+        if self._synonyms_cache is not None:
+            return self._synonyms_cache
+
+        try:
+            from src.rag.service import load_erp_registry
+            reg = load_erp_registry()
+            if reg and "all_tables" in reg:
+                self._synonyms_cache = build_dynamic_table_synonyms(reg["all_tables"])
+                return self._synonyms_cache
+        except Exception:
+            pass
+        return {}
+
+    def __getitem__(self, key: str) -> str:
+        cache = self._ensure_synonyms()
+        k_low = key.lower().strip()
+        if k_low in cache:
+            return cache[k_low]
+        return super().__getitem__(key)
+
+    def get(self, key: str, default=None):
+        cache = self._ensure_synonyms()
+        k_low = key.lower().strip()
+        if k_low in cache:
+            return cache[k_low]
+        return default
+
+    def __contains__(self, key: str) -> bool:
+        cache = self._ensure_synonyms()
+        return key.lower().strip() in cache
+
+    def __iter__(self):
+        cache = self._ensure_synonyms()
+        return iter(cache)
+
+    def __len__(self):
+        cache = self._ensure_synonyms()
+        return len(cache)
+
+    def keys(self):
+        cache = self._ensure_synonyms()
+        return cache.keys()
+
+    def values(self):
+        cache = self._ensure_synonyms()
+        return cache.values()
+
+    def items(self):
+        cache = self._ensure_synonyms()
+        return cache.items()
+
+    def clear_cache(self):
+        self._synonyms_cache = None
+
+
+TABLE_SYNONYMS = DynamicTableSynonyms()
 
 # =====================================================================
 # Anti-Hallucination Rejection Patterns (Nonexistent Entities)
 # =====================================================================
 
-NONEXISTENT_TABLE_PATTERNS: List[str] = [
-    "employee_benefits", "employee benefits", "benefits table",
-    "salary_history", "salary history", "payment_history", "payment history",
-    "sales_orders", "sales order", "sales orders", "tax_management", "tax management",
-    "leave_requests", "leave request", "leave requests",
-    "supplier_payment", "supplier payment", "customer_complaints", "customer complaints", "customer payment",
-    "customer payment history"
-]
+# Dynamically resolved against PostgreSQL catalog at runtime (zero static hardcoding)
+NONEXISTENT_TABLE_PATTERNS: List[str] = []
+
 
 def resolve_canonical_table_name(text: str, all_tables: Dict[str, Any]) -> Optional[str]:
-    """Resolves table name by checking exact names, underscores/spaces, synonyms, and word boundaries."""
+    """
+    Dynamically resolves table name for ANY table in the knowledge base without requiring
+    hardcoded static dictionaries. Checks exact matches, whitespace/underscore variants,
+    inflections (singular/plural), domain prefix stripping, and metadata keywords from PostgreSQL.
+    """
     t_lower = text.lower().strip()
+    if not t_lower or not all_tables:
+        return None
+
+    # 1. Exact match
     if t_lower in all_tables:
         return t_lower
-    if t_lower.replace(" ", "_") in all_tables:
-        return t_lower.replace(" ", "_")
+    t_underscored = t_lower.replace(" ", "_")
+    if t_underscored in all_tables:
+        return t_underscored
+
+    # 2. Dynamic synonyms lookup
     if t_lower in TABLE_SYNONYMS:
         return TABLE_SYNONYMS[t_lower]
+
+    # 3. Dynamic search across all active tables in DB catalog
     for t in sorted(all_tables.keys(), key=len, reverse=True):
-        if re.search(r"\b" + re.escape(t) + r"\b", t_lower) or re.search(r"\b" + re.escape(t.replace("_", " ")) + r"\b", t_lower):
+        t_space = t.replace("_", " ")
+        if re.search(r"\b" + re.escape(t) + r"\b", t_lower) or re.search(r"\b" + re.escape(t_space) + r"\b", t_lower):
             return t
+
+        # Plural / singular inflection
+        if t.endswith("s") and len(t) > 3:
+            t_sing = t[:-1]
+            t_sing_space = t_space[:-1]
+            if re.search(r"\b" + re.escape(t_sing) + r"\b", t_lower) or re.search(r"\b" + re.escape(t_sing_space) + r"\b", t_lower):
+                return t
+        elif t.endswith("ies") and len(t) > 4:
+            t_sing = t[:-3] + "y"
+            if re.search(r"\b" + re.escape(t_sing) + r"\b", t_lower):
+                return t
+
+        # Prefix-stripped variants (e.g., 'hrms_employees' -> 'employees', 'bank_branches' -> 'branches')
+        if "_" in t:
+            suffix = t.split("_", 1)[1]
+            suffix_space = suffix.replace("_", " ")
+            if len(suffix) >= 4 and (re.search(r"\b" + re.escape(suffix) + r"\b", t_lower) or re.search(r"\b" + re.escape(suffix_space) + r"\b", t_lower)):
+                return t
+
+        # Table keywords stored in DB metadata
+        tbl_meta = all_tables.get(t, {})
+        for kw in tbl_meta.get("keywords", []):
+            kw_clean = str(kw).lower().strip()
+            if len(kw_clean) >= 4 and re.search(r"\b" + re.escape(kw_clean) + r"\b", t_lower):
+                return t
+
+    # 4. Synonym substring boundaries
     for syn, t in sorted(TABLE_SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True):
         if re.search(r"\b" + re.escape(syn) + r"\b", t_lower):
             return t
+
     return None
 
 
 __all__ = [
     "TABLE_SYNONYMS",
     "NONEXISTENT_TABLE_PATTERNS",
+    "get_word_inflections",
+    "build_dynamic_table_synonyms",
     "resolve_canonical_table_name",
 ]

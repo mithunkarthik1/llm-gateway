@@ -24,6 +24,7 @@ from src.rag.config import (
 from utils.domain_priority import (
     DOMAIN_PRIMARY_TABLES,
     TABLE_PRIMARY_COLUMNS_MAP,
+    get_domain_primary_tables,
     prioritize_table_columns,
 )
 from utils.schema_synonyms import (
@@ -269,7 +270,10 @@ def _load_erp_registry_from_postgres() -> Optional[Dict[str, Any]]:
 
                 registry["domains"][dom_id] = {
                     "id": dom_id,
+                    "domain_id": dom_id,
                     "name": dom.domain_name,
+                    "description": dom.description or "",
+                    "keywords": dom.keywords or [dom_id.replace("erp_", "").replace("_", " ")],
                     "tables": d_tables
                 }
 
@@ -812,6 +816,243 @@ class QueryPlan:
             "exact_name_required": self.exact_name_required
         }
 
+
+def resolve_requested_domain_from_db(
+    q_clean: str,
+    domains: Dict[str, Any],
+    all_table_lookup: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """
+    Dynamically identifies requested domain for ANY existing or newly uploaded domain
+    using metadata stored in PostgreSQL (domain_id, domain_name, description, keywords).
+    Features semantic keyword scoring, table grounding, and zero hardcoded domain regexes.
+    """
+    if not q_clean or not domains:
+        return None
+
+    domain_scores: Dict[str, float] = {}
+
+    for d_id, d_meta in domains.items():
+        score = 0.0
+        d_id_clean = d_id.lower()
+        d_short = d_id_clean.replace("erp_", "").replace("_", " ")
+        d_name = (d_meta.get("name") or "").lower()
+        d_keywords = [str(k).lower().strip() for k in d_meta.get("keywords", [])]
+
+        # 1. Exact domain_id or shortened name (e.g., 'finance', 'banking', 'supply chain', 'hrms')
+        if re.search(r"\b" + re.escape(d_id_clean) + r"\b", q_clean):
+            score += 20.0
+        elif len(d_short) >= 3 and re.search(r"\b" + re.escape(d_short) + r"\b", q_clean):
+            score += 15.0
+
+        # 2. Check full domain name or key parts (e.g. 'Healthcare Management', 'Core Banking & Financial Services')
+        if d_name and len(d_name) > 3:
+            if re.search(r"\b" + re.escape(d_name) + r"\b", q_clean):
+                score += 12.0
+            else:
+                for word in d_name.split():
+                    if len(word) >= 4 and word not in ("management", "services", "system", "enterprise", "core", "overview"):
+                        if re.search(r"\b" + re.escape(word) + r"\b", q_clean):
+                            score += 5.0
+
+        # 3. Domain keywords from DB metadata
+        for kw in d_keywords:
+            if len(kw) >= 3:
+                pat = r"\b" + re.escape(kw) + r"(?:al|s|ic|ical|ing|ian|ed)?\b"
+                if re.search(pat, q_clean):
+                    score += 8.0
+                elif kw.endswith("s") and len(kw) > 4 and re.search(r"\b" + re.escape(kw[:-1]) + r"\b", q_clean):
+                    score += 7.0
+                elif not kw.endswith("s") and re.search(r"\b" + re.escape(kw + "s") + r"\b", q_clean):
+                    score += 7.0
+
+        # 4. Table names belonging to this domain
+        for tbl in d_meta.get("tables", []):
+            tname = tbl.get("table_name", "").lower()
+            if tname:
+                t_clean = tname.replace("_", " ")
+                if re.search(r"\b" + re.escape(tname) + r"\b", q_clean) or re.search(r"\b" + re.escape(t_clean) + r"\b", q_clean):
+                    score += 10.0
+                elif tname.endswith("s") and len(tname) > 4 and (re.search(r"\b" + re.escape(tname[:-1]) + r"\b", q_clean) or re.search(r"\b" + re.escape(t_clean[:-1]) + r"\b", q_clean)):
+                    score += 9.0
+
+        if score > 0.0:
+            domain_scores[d_id] = score
+
+    if domain_scores:
+        best_domain = max(domain_scores, key=domain_scores.get)
+        if domain_scores[best_domain] >= 5.0:
+            return best_domain
+
+    # 5. ChromaDB vector semantic fallback (requires confident similarity >= 0.50)
+    try:
+        from utils.sync_chroma import get_chroma_engine
+        engine = get_chroma_engine()
+        if engine.count() > 0:
+            c_res = engine.search(q_clean, top_k=3, where={"segment_type": "domain"})
+            if c_res and c_res[0].get("similarity", 0.0) >= 0.50:
+                top_meta = c_res[0].get("metadata", {})
+                dom_code = top_meta.get("domain_code")
+                if dom_code and dom_code in domains:
+                    return dom_code
+    except Exception as e:
+        logger.debug(f"ChromaDB domain semantic fallback check skipped: {e}")
+
+    return None
+
+
+ENGLISH_NUMBERS: Dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "twenty-one": 21, "twenty one": 21, "twenty-two": 22, "twenty two": 22,
+    "twenty-three": 23, "twenty three": 23, "twenty-four": 24, "twenty four": 24,
+    "twenty-five": 25, "twenty five": 25, "thirty": 30, "forty": 40, "fifty": 50,
+}
+
+
+def parse_number_token(tok: str) -> Optional[int]:
+    if not tok:
+        return None
+    tok_clean = tok.strip().lower()
+    if tok_clean.isdigit():
+        return int(tok_clean)
+    if tok_clean in ENGLISH_NUMBERS:
+        return ENGLISH_NUMBERS[tok_clean]
+    hyphenated = tok_clean.replace(" ", "-")
+    if hyphenated in ENGLISH_NUMBERS:
+        return ENGLISH_NUMBERS[hyphenated]
+    return None
+
+
+def extract_table_count(q_clean: str) -> Optional[int]:
+    """
+    Extracts explicit table count constraints from natural language queries across all phrasing styles.
+    Supports digits and written English words without static limits.
+    """
+    # 1. Modifiers + number + tables (e.g. 'with 10 tables', 'having 10 tables', 'only 5 tables', 'top 10 tables')
+    p1 = re.search(
+        r"\b(?:with|having|containing|consisting\s+of|include|including|only|top|first|exactly|limit(?:\s+to)?|at\s+most|up\s+to|max|maximum|of)\s+(\d+|[a-z\-]+)\s+tables?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p1:
+        n = parse_number_token(p1.group(1))
+        if n is not None and n > 0:
+            return n
+
+    # 2. Action verbs + (optional article) + number + tables (e.g. 'create 10 tables', 'generate 10 tables', 'give me 10 tables')
+    p2 = re.search(
+        r"\b(?:create|generate|retrieve|get|show|fetch|give(?:\s+me)?|make|build|construct|select)\s+(?:a\s+|an\s+|the\s+)?(\d+|[a-z\-]+)\s+tables?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p2:
+        n = parse_number_token(p2.group(1))
+        if n is not None and n > 0:
+            return n
+
+    # 3. Adjectival or hyphenated count (e.g. '10-table schema', '10 table database', 'ten-table model')
+    p3 = re.search(
+        r"\b(\d+|[a-z\-]+)[-\s]tables?\s+(?:schema|schemas|database|db|model|system|structure|catalog|application|app)\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p3:
+        n = parse_number_token(p3.group(1))
+        if n is not None and n > 0:
+            return n
+
+    # 4. Key-value count (e.g. 'tables: 10', 'count: 10', 'table count = 10')
+    p4 = re.search(
+        r"\b(?:table\s+count|tables\s+count|count|tables?)\s*[:=]\s*(\d+|[a-z\-]+)\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p4:
+        n = parse_number_token(p4.group(1))
+        if n is not None and n > 0:
+            return n
+
+    # 5. Standalone '<number> tables' (excluding stopwords like 'all tables', 'these tables')
+    p5 = re.search(
+        r"\b(\d+|[a-z\-]+)\s+tables?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p5:
+        cand = p5.group(1).lower()
+        if cand not in ("all", "these", "those", "other", "some", "few", "many", "multiple", "several", "each", "every", "more"):
+            n = parse_number_token(cand)
+            if n is not None and n > 0:
+                return n
+
+    return None
+
+
+def extract_column_count(q_clean: str) -> Optional[int]:
+    """
+    Extracts explicit column count constraints from natural language queries across all phrasing styles.
+    """
+    if re.search(r"\b(?:with|having|only|containing|create|get|show|select|retrieve)\s+(?:a|an|one)\s+columns?\b", q_clean, re.IGNORECASE):
+        return 1
+
+    p1 = re.search(
+        r"\b(?:with|having|containing|consisting\s+of|include|including|only|top|first|exactly|limit(?:\s+to)?|at\s+most|up\s+to|max|maximum|of)\s+(\d+|[a-z\-]+)\s+columns?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p1:
+        n = parse_number_token(p1.group(1))
+        if n is not None and n > 0:
+            return n
+
+    p2 = re.search(
+        r"\b(?:create|generate|retrieve|get|show|fetch|give(?:\s+me)?|make|build|construct|select)\s+(?:a\s+|an\s+|the\s+)?(\d+|[a-z\-]+)\s+columns?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p2:
+        n = parse_number_token(p2.group(1))
+        if n is not None and n > 0:
+            return n
+
+    p3 = re.search(
+        r"\b(\d+|[a-z\-]+)[-\s]columns?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p3:
+        n = parse_number_token(p3.group(1))
+        if n is not None and n > 0:
+            return n
+
+    p4 = re.search(
+        r"\b(?:column\s+count|columns\s+count|count|columns?)\s*[:=]\s*(\d+|[a-z\-]+)\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p4:
+        n = parse_number_token(p4.group(1))
+        if n is not None and n > 0:
+            return n
+
+    p5 = re.search(
+        r"\b(\d+|[a-z\-]+)\s+columns?\b",
+        q_clean,
+        re.IGNORECASE
+    )
+    if p5:
+        cand = p5.group(1).lower()
+        if cand not in ("all", "these", "those", "other", "some", "few", "many", "multiple", "several", "each", "every", "more"):
+            n = parse_number_token(cand)
+            if n is not None and n > 0:
+                return n
+
+    return None
+
+
 def create_query_plan(
     query: str,
     all_table_lookup: Dict[str, Any],
@@ -841,7 +1082,26 @@ def create_query_plan(
         plan.nonexistent_candidates.append("empty_query")
         return plan
 
-    # 1. Explicit Nonexistent Tables Check
+    # 1. Explicit Nonexistent Tables Check (Dynamic catalog check with zero static lists)
+    m_compound_table = re.search(r"\b([a-z0-9_]+(?:\s+[a-z0-9_]+)+)\s+(?:table|schema)\b", q_clean)
+    if m_compound_table:
+        compound = m_compound_table.group(1).strip()
+        compound_cand = re.sub(r"^(?:show\s+me\s+(?:the\s+)?|get\s+(?:the\s+)?|search\s+for\s+(?:the\s+)?|find\s+(?:the\s+)?|the\s+)", "", compound).strip()
+        cand_underscore = compound_cand.replace(" ", "_")
+        # Ensure the compound is not an actual domain title (e.g. 'inventory management schema')
+        is_dom_title = any(
+            compound_cand in (d_id.lower().replace("erp_", "").replace("_", " "), (d_meta.get("name") or "").lower())
+            or (compound_cand in (d_meta.get("name") or "").lower() and len(compound_cand) >= 8)
+            for d_id, d_meta in domains.items()
+        )
+        if not is_dom_title:
+            if cand_underscore not in all_table_lookup and compound_cand not in TABLE_SYNONYMS and cand_underscore not in TABLE_SYNONYMS:
+                words = compound_cand.split()
+                tail_cand = " ".join(words[-2:]) if len(words) >= 2 else compound_cand
+                if any(compound_cand.endswith(sfx) for sfx in ["history", "benefits", "requests", "request", "complaints", "complaint", "logs", "log"]):
+                    plan.nonexistent_candidates.append(tail_cand)
+                    return plan
+
     for bad_tbl in NONEXISTENT_TABLE_PATTERNS:
         if bad_tbl in q_clean:
             plan.nonexistent_candidates.append(bad_tbl)
@@ -872,18 +1132,10 @@ def create_query_plan(
         return plan
 
     # 4. Exact Table Count
-    m_count = re.search(r"\b(?:exactly\s+)?(1|2|3|4|5|one|two|three|four|five)\s+tables?\b", q_clean)
-    if m_count:
-        c_word = m_count.group(1).lower()
-        word_map = {"1": 1, "one": 1, "2": 2, "two": 2, "3": 3, "three": 3, "4": 4, "four": 4, "5": 5, "five": 5}
-        plan.exact_table_count = word_map.get(c_word)
+    plan.exact_table_count = extract_table_count(q_clean)
 
     # 4b. Exact Column Count
-    m_col_count = re.search(r"\b(?:exactly\s+)?(1|2|3|4|5|6|7|8|one|two|three|four|five|six|seven|eight|a)\s+columns?\b", q_clean)
-    if m_col_count:
-        c_col_word = m_col_count.group(1).lower()
-        col_word_map = {"1": 1, "one": 1, "a": 1, "2": 2, "two": 2, "3": 3, "three": 3, "4": 4, "four": 4, "5": 5, "five": 5, "6": 6, "six": 6, "7": 7, "seven": 7, "8": 8, "eight": 8}
-        plan.exact_column_count = col_word_map.get(c_col_word)
+    plan.exact_column_count = extract_column_count(q_clean)
 
     # 5. Exclude Tables
     m_exclude = re.search(r"\b(?:do not retrieve|do not include|excluding|exclude|without|except|not)\s+([a-zA-Z0-9_ ]+)", q_clean)
@@ -907,7 +1159,7 @@ def create_query_plan(
         return plan
 
     # 7-pre: Count-Based Column Retrieval (e.g. "create 2 columns for customer_invoices")
-    if plan.exact_column_count:
+    if plan.exact_column_count and not plan.exact_table_count:
         col_target_tbl = None
         for tname in sorted(all_table_lookup.keys(), key=lambda x: len(x.replace("_", " ")), reverse=True):
             for v in [tname, tname.replace("_", " ")]:
@@ -925,16 +1177,16 @@ def create_query_plan(
             col_target_tbl = session_context_table
 
         if not col_target_tbl:
-            # Check domain keywords (e.g. "create 2 columns for finance system")
-            if re.search(r"\b(?:erp\s+)?(?:finance|financial|accounting)\b", q_clean):
-                col_target_tbl = "chart_of_accounts"
-                plan.requested_domain = "erp_finance"
-            elif re.search(r"\b(?:erp\s+)?(?:hrms|human\s+resources|hr|employee\s+management)\b", q_clean):
-                col_target_tbl = "hrms_employees"
-                plan.requested_domain = "erp_hrms"
-            elif re.search(r"\b(?:erp\s+)?(?:supply\s+chain|warehouse(?:\s+and\s+inventory)?|inventory(?:\s+management)?)\b", q_clean):
-                col_target_tbl = "product_items"
-                plan.requested_domain = "erp_supply_chain"
+            # Dynamically detect domain from PostgreSQL metadata (e.g. "create 2 columns for banking", "create 2 columns for finance")
+            detected_dom = resolve_requested_domain_from_db(q_clean, domains, all_table_lookup)
+            if detected_dom and detected_dom in domains:
+                plan.requested_domain = detected_dom
+                dom_tbls = domains[detected_dom].get("tables", [])
+                core_tbls = get_domain_primary_tables(detected_dom, dom_tbls)
+                if core_tbls:
+                    col_target_tbl = core_tbls[0]
+                elif dom_tbls:
+                    col_target_tbl = dom_tbls[0]["table_name"]
 
         if not col_target_tbl:
             # Check if a non-existent table was named (e.g. "create account table with 2 columns")
@@ -1232,6 +1484,9 @@ def create_query_plan(
 
     for syn in sorted(TABLE_SYNONYMS.keys(), key=len, reverse=True):
         tname = TABLE_SYNONYMS[syn]
+        # Skip synonym if it forms a domain / system phrase (e.g. 'inventory management', 'employee management')
+        if re.search(r"\b" + re.escape(syn) + r"\s+(?:management|system|application|app|domain|overview)\b", q_clean):
+            continue
         for m in re.finditer(r"\b" + re.escape(syn) + r"\b", q_clean):
             if not any(r[0] <= m.start() and m.end() <= r[1] for r in matched_ranges):
                 matched_ranges.append((m.start(), m.end()))
@@ -1241,16 +1496,42 @@ def create_query_plan(
     # 10b. Check if an explicit table/schema entity was requested that is NOT in catalog
     # (e.g. "create a account schema for ERP FINANCE", "create table users in HRMS")
     if not plan.roots and not plan.nonexistent_candidates:
+        dynamic_domain_words = set()
+        for d_id, d_meta in domains.items():
+            dynamic_domain_words.add(d_id.lower())
+            dynamic_domain_words.add(d_id.lower().replace("erp_", ""))
+            dynamic_domain_words.update(w.lower() for w in d_id.lower().replace("erp_", "").split("_"))
+            dynamic_domain_words.update(w.lower() for w in (d_meta.get("name") or "").split() if w.lower() not in ("services", "core", "management", "system", "overview"))
+
         stop_words = {
             "erp", "db", "database", "complete", "entire", "all", "new", "finance", "hrms", "supply", "chain",
             "create", "retrieve", "get", "show", "make", "give", "find", "search", "for", "in", "of", "a", "an", "the",
-            "tables", "schemas", "system", "management", "build", "generate", "construct", "setup", "architect", "define"
+            "tables", "schemas", "system", "management", "build", "generate", "construct", "setup", "architect", "define",
+            "with", "having", "containing", "consisting", "include", "including", "only", "top", "first", "exactly",
+            "limit", "max", "maximum", "at", "most", "up", "to", "app", "application", "services", "core", "overview",
+            "data", "metadata", "details", "structure", "table", "tables", "schema", "schemas", "model", "models", "entity", "entities"
         }
-        for pat in [r"\b(?:table|schema)\s+([a-zA-Z0-9_]+)\b", r"\b(?:a|an|the)?\s*([a-zA-Z0-9_]+)\s+(?:table|schema)\b"]:
+        stop_words.update(dynamic_domain_words)
+
+        detected_dom = resolve_requested_domain_from_db(q_clean, domains, all_table_lookup)
+
+        for pat in [
+            r"\b(?:search\s+for|find|look\s+for|retrieve|show|get|display|fetch|create|architect|construct)\s+(?:the\s+)?([a-zA-Z0-9_]+)\b",
+            r"\b(?:table|schema)\s+([a-zA-Z0-9_]+)\b",
+            r"\b(?:a|an|the)?\s*([a-zA-Z0-9_]+)\s+(?:table|schema)\b"
+        ]:
             m_entity = re.search(pat, q_clean)
             if m_entity:
-                cand = m_entity.group(1).strip()
-                if cand not in stop_words and cand not in all_table_lookup and cand not in TABLE_SYNONYMS:
+                cand = m_entity.group(1).strip().lower()
+                if (
+                    cand not in stop_words
+                    and cand not in all_table_lookup
+                    and cand not in TABLE_SYNONYMS
+                    and not cand.isdigit()
+                    and cand not in ENGLISH_NUMBERS
+                    and len(cand) > 2
+                    and not (plan.exact_table_count and detected_dom)
+                ):
                     plan.nonexistent_candidates.append(cand)
                     return plan
 
@@ -1309,17 +1590,7 @@ def create_query_plan(
         plan.expand_dependencies = "none"
 
     if not plan.roots and not plan.nonexistent_candidates:
-        if re.search(r"\b(?:erp\s+)?(?:finance|financial|accounting)\b", q_clean):
-            plan.requested_domain = "erp_finance"
-        elif re.search(r"\b(?:erp\s+)?(?:hrms|human\s+resources|hr|employee\s+management)\b", q_clean):
-            plan.requested_domain = "erp_hrms"
-        elif re.search(r"\b(?:erp\s+)?(?:supply\s+chain|warehouse(?:\s+and\s+inventory)?|inventory(?:\s+management)?)\b", q_clean):
-            plan.requested_domain = "erp_supply_chain"
-        elif re.search(r"\b(?:erp\s+)?(?:ecommerce|e-commerce|e\s+commerce|online\s+store|retail|shopping|cart)\b", q_clean):
-            plan.requested_domain = "erp_ecommerce"
-        elif re.search(r"\b(?:erp\s+)?(?:healthcare|health\s+care|health|hospital|clinic|medical)\b", q_clean):
-            plan.requested_domain = "erp_healthcare"
-        elif any(w in q_clean for w in [
+        if any(w in q_clean for w in [
             "all domains", "all tables from the erp", "all 15 tables", "complete erp",
             "entire erp", "all erp tables", "whole erp", "all tables in erp",
             "show all tables from the erp application", "create db schemas for erp application",
@@ -1328,11 +1599,16 @@ def create_query_plan(
             plan.is_entire_app = True
             plan.roots = list(all_table_lookup.keys())
             return plan
+
+        # Dynamically detect domain from PostgreSQL metadata and ChromaDB
+        detected_dom = resolve_requested_domain_from_db(q_clean, domains, all_table_lookup)
+        if detected_dom:
+            plan.requested_domain = detected_dom
         else:
             m_s = re.search(r"(?:search for|find|retrieve|get|show)\s+(?:the\s+)?([a-zA-Z0-9_]+(?:\s+[a-zA-Z0-9_]+)?)\s*(?:table|schema)?$", q_clean)
             if m_s:
                 c_tbl = m_s.group(1).strip()
-                if c_tbl not in ["the", "all", "complete", "details", "database", "finance", "hrms", "supply", "chain", "ecommerce", "healthcare", "health", "medical", "erp"]:
+                if c_tbl not in ["the", "all", "complete", "details", "database", "erp"]:
                     plan.nonexistent_candidates.append(c_tbl)
 
     return plan
@@ -1626,7 +1902,7 @@ def execute_plan(
         dom_tables = topological_sort_tables(dom_raw)
 
         if plan.exact_table_count and plan.exact_table_count > 0 and len(dom_tables) > plan.exact_table_count:
-            primary_priority = DOMAIN_PRIMARY_TABLES.get(dom_id, [])
+            primary_priority = get_domain_primary_tables(dom_id, dom_raw)
             def get_priority(tbl):
                 tname = tbl["table_name"].lower()
                 if tname in primary_priority:

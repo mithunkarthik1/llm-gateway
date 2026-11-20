@@ -52,21 +52,15 @@ def classify_rag_operation_and_intent(query: str, sql: str, rag_result: Any) -> 
     if re.search(r"\b(?:alter\s+table|add\s+column|drop\s+column|modify\s+column|change\s+column|rename\s+column)\b", q_low):
         return "ALTER_TABLE", "SCHEMA"
 
-    # 7. Entity not found or rejected
-    if getattr(rag_result, "domain", "") == "not_found" or getattr(rag_result, "status", "") == "rejected" or not clean_sql:
-        return "TECHNICAL_QA", "SCHEMA"
-
-    # 8. Check question vs creation intent
-    is_pure_question = bool(re.search(r"\b(?:which\s+column|what\s+column|what\s+is|explain\s+what|why\s+is|how\s+does|how\s+do|tell\s+me\s+about)\b", q_low))
-    has_create_intent = bool(re.search(r"\b(?:create|generate|make|build|setup|set\s+up|construct|define|add|schemas?\s+for|tables?\s+for|database\s+for|db\s+for)\b", q_low))
+    # 7. Pure conceptual question vs creation intent
+    is_pure_question = bool(re.search(r"\b(?:what\s+is|explain\s+what|why\s+is|how\s+does|how\s+do|tell\s+me\s+about|what\s+does)\b", q_low))
+    has_create_intent = bool(re.search(r"\b(?:create|generate|make|build|setup|set\s+up|construct|define|add|retrieve|get|show|fetch|give|schemas?\s+for|tables?\s+for|database\s+for|db\s+for)\b", q_low))
 
     if is_pure_question and not has_create_intent:
-        return "TECHNICAL_QA", "SCHEMA"
+        return "TECHNICAL_QA", "RELATED"
 
-    if has_create_intent or "CREATE TABLE" in clean_sql.upper():
-        return "CREATE_TABLE", "SCHEMA"
-
-    return "CREATE_TABLE" if "CREATE TABLE" in clean_sql.upper() else "TECHNICAL_QA", "SCHEMA"
+    # 8. Schema creation & retrieval operations
+    return "CREATE_TABLE", "SCHEMA"
 
 
 def extract_pure_sql_query(sql_text: str) -> str:
@@ -123,6 +117,12 @@ def generate_table_endpoint(payload: GenerateRequest):
         target_model = gw_decision.get("suggested_model") or gw_decision.get("recommended_engine") or gw_decision.get("model_name", "rag-enterprise")
         enhanced = gw_decision.get("enhanced_prompt") or gw_decision.get("refined_query") or payload.prompt
         gw_tokens = gw_decision.get("token_used") or gw_decision.get("gateway_tokens", 0)
+
+        # Safeguard: ensure explicit table count from user prompt is preserved
+        raw_prompt = (payload.prompt or "").strip()
+        count_match = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+tables?\b", raw_prompt, re.IGNORECASE)
+        if count_match and not re.search(r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+tables?\b", enhanced, re.IGNORECASE):
+            enhanced = f"{enhanced} with {count_match.group(0)}"
 
         logger.info(f"Gateway routed turn: op='{op_gw}' | target_model='{target_model}' | enhanced='{enhanced}'")
 

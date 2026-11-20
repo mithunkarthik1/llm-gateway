@@ -45,13 +45,13 @@ class TestPostgreSQLKnowledgeBaseIntegration(unittest.TestCase):
     # =========================================================================
 
     def test_01_all_domains_ingested(self):
-        """Verify all 5 enterprise domains are stored with proper metadata."""
+        """Verify enterprise domains are stored with proper metadata."""
         with get_db() as session:
             repo = KnowledgeBaseRepository(session)
             domains = repo.list_domains()
             domain_ids = [d.domain_id for d in domains]
             expected = ["erp_ecommerce", "erp_finance", "erp_healthcare", "erp_hrms", "erp_supply_chain"]
-            self.assertEqual(len(domains), 5)
+            self.assertGreaterEqual(len(domains), 5)
             for exp in expected:
                 self.assertIn(exp, domain_ids)
 
